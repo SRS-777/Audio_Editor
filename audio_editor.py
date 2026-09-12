@@ -11,13 +11,14 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QHBoxLayout, QPushButton, QFileDialog, QMessageBox,
     QSlider, QLabel, QComboBox, QDoubleSpinBox, QGroupBox,
-    QCheckBox, QGridLayout, QTabWidget, QSizePolicy, QFrame
+    QCheckBox, QGridLayout, QTabWidget, QSizePolicy, QFrame,
+    QDialog
 )
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from scipy.signal import resample
+from scipy.signal import fftconvolve
 
-# Dark Modern DAW Stylesheet – enhanced for better visuals
 DARK_STYLE = """
 QMainWindow { background-color: #0d0e12; }
 QWidget { background-color: #0d0e12; color: #e0e0e0; font-family: 'Helvetica', Arial, sans-serif; font-size: 12px; }
@@ -40,10 +41,32 @@ QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; }
 QDoubleSpinBox, QSpinBox { background-color: #1e222d; border: 1px solid #2a3040; border-radius: 3px; padding: 3px; color: #e0e0e0; }
 QCheckBox { color: #e0e0e0; }
 QTabWidget::pane { border: 1px solid #2a3040; border-radius: 4px; background-color: #0d0e12; }
-QTabBar::tab { background-color: #1e222d; color: #a0a0a0; padding: 6px 14px; border: 1px solid #2a3040; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; }
-QTabBar::tab:selected { background-color: #2a3040; color: #ffaa00; }
-QTabBar::tab:hover { background-color: #2a3040; }
-/* File info label */
+QTabBar {
+    background-color: #0d0e12;
+    border: 1px solid #2a3040;
+    border-radius: 6px;
+    padding: 2px;
+    qproperty-drawBase: 0;
+}
+QTabBar::tab { 
+    background-color: #1e222d; 
+    color: #a0a0a0; 
+    padding: 12px 40px; 
+    font-size: 14px; 
+    font-weight: bold; 
+    border: 1px solid #2a3040; 
+    border-radius: 4px; 
+    margin: 2px 3px; 
+}
+QTabBar::tab:selected { 
+    background-color: #2a3040; 
+    color: #ffaa00; 
+    border: 1px solid #3a4050; 
+}
+QTabBar::tab:hover { 
+    background-color: #2a3040; 
+    border: 1px solid #3a4050; 
+}
 #fileInfo { 
     font-family: 'Helvetica', Arial, sans-serif; 
     font-size: 12px; 
@@ -53,11 +76,16 @@ QTabBar::tab:hover { background-color: #2a3040; }
     border-radius: 4px; 
     padding: 4px 10px; 
 }
-/* Separator line */
-.separator {
-    background-color: #2a3040;
-    width: 1px;
-    margin: 4px 0px;
+#eqValue { 
+    color: #ffaa00; 
+    font-size: 12px; 
+    font-weight: bold;
+    padding: 0 4px;
+}
+#undoCount {
+    color: #70778c;
+    font-size: 11px;
+    padding: 0 4px;
 }
 """
 
@@ -65,6 +93,20 @@ def format_time(seconds):
     if seconds is None or seconds < 0: return "00:00"
     mins = int(seconds // 60); secs = int(seconds % 60)
     return f"{mins:02d}:{secs:02d}"
+
+# ----------------------------------------------------------------------
+# Helper: make all controls in a group fill their grid columns
+# ----------------------------------------------------------------------
+def fill_group(group):
+    """Make every widget in a group expand horizontally and center labels."""
+    for w in group.findChildren((QPushButton, QDoubleSpinBox, QComboBox, QCheckBox)):
+        w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    for w in group.findChildren(QSlider):
+        w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    for w in group.findChildren(QLabel):
+        if w.objectName() != "eqValue":
+            w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            w.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
 # ----------------------------------------------------------------------
 # Waveform Canvas
@@ -158,23 +200,88 @@ class SpectrumCanvas(FigureCanvas):
         self.fig.subplots_adjust(left=0.08, right=0.98, top=0.93, bottom=0.15)
         self.fig.tight_layout()
 
-    def plot_spectrum(self, audio, sr, title="Spectrum"):
+    def plot_spectrum(self, audio, sr, title="Spectrum", center_time=None):
         self.axes.clear()
-        if len(audio) == 0:
+        if len(audio) < 64:
             return
-        n_fft = min(4096, len(audio))
-        if n_fft < 64:
-            n_fft = 64
-        fft_data = np.fft.rfft(audio[:n_fft])
-        freq = np.fft.rfftfreq(n_fft, d=1/sr)
+
+        n_fft = 16384
+        if len(audio) < n_fft:
+            n_fft = len(audio)
+
+        if center_time is None:
+            start = int(2.0 * sr)
+        else:
+            start = int(center_time * sr) - n_fft // 2
+        start = max(0, min(start, len(audio) - n_fft))
+        segment = audio[start:start + n_fft].astype(float)
+
+        window = np.hanning(len(segment))
+        segment = segment * window
+
+        fft_data = np.fft.rfft(segment)
+        freq = np.fft.rfftfreq(len(segment), d=1/sr)
         mag = np.abs(fft_data)
+        mag = mag / (np.sum(window) / 2 + 1e-12)
         mag_db = 20 * np.log10(mag + 1e-12)
-        self.axes.plot(freq, mag_db, color='#00e5ff', linewidth=0.7)
-        self.axes.set_xlim(0, sr/2)
-        self.axes.set_ylim(-80, 10)
+
+        self.axes.plot(freq, mag_db, color='#00e5ff', linewidth=0.8)
+        self.axes.set_xlim(0, sr / 2)
+        self.axes.set_ylim(-100, 5)
         self.axes.set_title(title, color='#e0e0e0', fontsize=8)
         self.axes.grid(True, color='#404040', linestyle='--', linewidth=0.5, alpha=0.3)
         self.draw()
+
+# ----------------------------------------------------------------------
+# Pitch Over Time Dialog
+# ----------------------------------------------------------------------
+class PitchPlotDialog(QDialog):
+    def __init__(self, times, pitches, median_pitch, dominant_pitch, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pitch Contour")
+        self.resize(900, 420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        n_voiced = int(np.sum(~np.isnan(pitches)))
+        info = QLabel(
+            f"Median: {median_pitch:.1f} Hz    "
+            f"Dominant: {dominant_pitch:.1f} Hz    "
+            f"Voiced frames: {n_voiced} / {len(pitches)}"
+        )
+        info.setStyleSheet("color: #ffaa00; font-size: 13px; padding: 4px;")
+        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(info)
+
+        fig = Figure(figsize=(9, 3.2), dpi=100, facecolor='#181b21')
+        ax = fig.add_subplot(111, facecolor='#181b21')
+
+        ax.plot(times, pitches, color='#00e5ff', linewidth=0.9, alpha=0.9)
+        ax.axhline(median_pitch, color='#ffaa00', linestyle='--',
+                   linewidth=1.2, label=f"Median: {median_pitch:.1f} Hz")
+        ax.axhline(dominant_pitch, color='#00ff88', linestyle=':',
+                   linewidth=1.0, label=f"Dominant: {dominant_pitch:.1f} Hz")
+
+        ax.set_xlabel("Time (s)", color='#c0c0c0', fontsize=9)
+        ax.set_ylabel("Pitch (Hz)", color='#c0c0c0', fontsize=9)
+        ax.set_title("Pitch Over Time", color='#e0e0e0', fontsize=11, pad=10)
+        ax.tick_params(colors='#c0c0c0', labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color('#404040')
+        ax.grid(True, color='#404040', linestyle='--', linewidth=0.5, alpha=0.35)
+        ax.legend(loc='upper right', fontsize=9,
+                  facecolor='#1e222d', edgecolor='#2a3040',
+                  labelcolor='#e0e0e0')
+        fig.tight_layout()
+
+        canvas = FigureCanvas(fig)
+        layout.addWidget(canvas)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
 
 # ----------------------------------------------------------------------
 # Main Workstation
@@ -195,37 +302,63 @@ class AudioWorkstation(QMainWindow):
         self.original_audio = None
         self.sr = None
         self.current_filename = ""
+        self.original_filename = ""
         self.undo_stack = []
         self.temp_file = "temp_edit.wav"
+        self.temp_counter = 0
         self.beat_times = None
 
-        # Remix storage
+        self.speed_factor = 1.0
+
+        self._last_spectrum_ms = -1
+        self._spectrum_update_interval_ms = 50
+
         self.remix_audio = None
         self.remix_filename = ""
+        self.previewing_remix = False
 
-        # Main layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(6)
 
-        # ---- Plot area (stretch=6) ----
+        # ---- Plot area ----
         plot_widget = QWidget()
         plot_layout = QVBoxLayout(plot_widget)
         plot_layout.setContentsMargins(0, 0, 0, 0)
         plot_layout.setSpacing(2)
 
         self.canvas = AudioCanvas(self, width=8, height=3.5)
+        self.canvas.setMinimumHeight(200)
         plot_layout.addWidget(self.canvas)
+
+        spectrum_controls = QHBoxLayout()
+        spectrum_controls.setSpacing(16)
 
         self.show_spectrum = QCheckBox("Show Spectrum")
         self.show_spectrum.setChecked(False)
         self.show_spectrum.stateChanged.connect(self.toggle_spectrum)
-        plot_layout.addWidget(self.show_spectrum)
+        spectrum_controls.addWidget(self.show_spectrum)
+
+        self.follow_playhead = QCheckBox("Follow Playhead")
+        self.follow_playhead.setChecked(False)
+        self.follow_playhead.setEnabled(False)
+        self.follow_playhead.setToolTip(
+            "When checked, the spectrum updates live as playback progresses."
+        )
+        spectrum_controls.addWidget(self.follow_playhead)
+
+        spectrum_controls.addStretch()
+        plot_layout.addLayout(spectrum_controls)
 
         self.spectrum_canvas = SpectrumCanvas(self, width=8, height=1.2)
         self.spectrum_canvas.setVisible(False)
+        self.spectrum_canvas.setMinimumHeight(160)
+        self.spectrum_canvas.setMaximumHeight(220)
+        self.spectrum_canvas.setStyleSheet(
+            "border: 1px solid #2a3040; border-radius: 4px; background-color: #181b21;"
+        )
         plot_layout.addWidget(self.spectrum_canvas)
 
         main_layout.addWidget(plot_widget, stretch=6)
@@ -242,11 +375,10 @@ class AudioWorkstation(QMainWindow):
         progress_layout.addWidget(self.lbl_total_time)
         main_layout.addLayout(progress_layout)
 
-        # ---- Playback Controls + File Info (redesigned) ----
+        # ---- Playback Controls + File Info ----
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(8)
 
-        # Group 1: Transport
         transport_group = QHBoxLayout()
         transport_group.setSpacing(4)
         self.btn_load = QPushButton("Load")
@@ -259,44 +391,41 @@ class AudioWorkstation(QMainWindow):
         transport_group.addWidget(self.btn_stop)
         controls_layout.addLayout(transport_group)
 
-        # Separator
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.Shape.VLine)
         sep1.setFrameShadow(QFrame.Shadow.Sunken)
         sep1.setStyleSheet("background-color: #2a3040; width: 1px;")
         controls_layout.addWidget(sep1)
 
-        # Group 2: File operations
         file_ops = QHBoxLayout()
         file_ops.setSpacing(4)
         self.btn_undo = QPushButton("Undo")
+        self.lbl_undo_count = QLabel("")
+        self.lbl_undo_count.setObjectName("undoCount")
         self.btn_save = QPushButton("Save")
         self.btn_reset = QPushButton("Reset")
         file_ops.addWidget(self.btn_undo)
+        file_ops.addWidget(self.lbl_undo_count)
         file_ops.addWidget(self.btn_save)
         file_ops.addWidget(self.btn_reset)
         controls_layout.addLayout(file_ops)
 
-        # Separator
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.VLine)
         sep2.setFrameShadow(QFrame.Shadow.Sunken)
         sep2.setStyleSheet("background-color: #2a3040; width: 1px;")
         controls_layout.addWidget(sep2)
 
-        # File info label – stretches
         self.lbl_info = QLabel("No file loaded")
         self.lbl_info.setObjectName("fileInfo")
         controls_layout.addWidget(self.lbl_info, stretch=1)
 
-        # Separator
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.Shape.VLine)
         sep3.setFrameShadow(QFrame.Shadow.Sunken)
         sep3.setStyleSheet("background-color: #2a3040; width: 1px;")
         controls_layout.addWidget(sep3)
 
-        # Group 3: View & Speed
         view_speed = QHBoxLayout()
         view_speed.setSpacing(6)
         self.lbl_zoom = QLabel("View:")
@@ -315,234 +444,257 @@ class AudioWorkstation(QMainWindow):
 
         main_layout.addLayout(controls_layout)
 
-        # ---- Tab Widget (stretch=4) ----
+        # ---- Tab Widget ----
         self.tab_widget = QTabWidget()
         self.tab_widget.setDocumentMode(True)
         self.tab_widget.setTabPosition(QTabWidget.TabPosition.North)
-        self.tab_widget.setMinimumHeight(180)
+        self.tab_widget.setMinimumHeight(220)
 
-        # ---------- Basic Tab ----------
+        # ========== Basic Tab ==========
         basic_tab = QWidget()
-        basic_layout = QVBoxLayout(basic_tab)
+        basic_layout = QHBoxLayout(basic_tab)
         basic_layout.setContentsMargins(8, 8, 8, 8)
-        basic_layout.setSpacing(8)
+        basic_layout.setSpacing(12)
 
-        # Amplitude group
         amp_group = QGroupBox("Amplitude")
         amp_layout = QGridLayout(amp_group)
-        amp_layout.setVerticalSpacing(6)
+        amp_layout.setVerticalSpacing(8)
         amp_layout.setHorizontalSpacing(10)
 
         self.btn_reverse = QPushButton("Reverse")
-        self.btn_reverse.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         amp_layout.addWidget(self.btn_reverse, 0, 0, 1, 3)
 
         amp_layout.addWidget(QLabel("Scale:"), 1, 0)
-        self.scale_spin = QDoubleSpinBox()
-        self.scale_spin.setRange(0.1, 10)
-        self.scale_spin.setValue(1)
+        self.scale_spin = QDoubleSpinBox(); self.scale_spin.setRange(0.1, 10); self.scale_spin.setValue(1)
         amp_layout.addWidget(self.scale_spin, 1, 1)
         self.btn_scale = QPushButton("Apply Scale")
         amp_layout.addWidget(self.btn_scale, 1, 2)
 
         amp_layout.addWidget(QLabel("Fade In:"), 2, 0)
-        self.fade_in_spin = QDoubleSpinBox()
-        self.fade_in_spin.setRange(0.1, 60)
-        self.fade_in_spin.setValue(2)
+        self.fade_in_spin = QDoubleSpinBox(); self.fade_in_spin.setRange(0.1, 60); self.fade_in_spin.setValue(2)
         amp_layout.addWidget(self.fade_in_spin, 2, 1)
         self.btn_fade_in = QPushButton("Apply")
         amp_layout.addWidget(self.btn_fade_in, 2, 2)
 
         amp_layout.addWidget(QLabel("Fade Out:"), 3, 0)
-        self.fade_out_spin = QDoubleSpinBox()
-        self.fade_out_spin.setRange(0.1, 60)
-        self.fade_out_spin.setValue(2)
+        self.fade_out_spin = QDoubleSpinBox(); self.fade_out_spin.setRange(0.1, 60); self.fade_out_spin.setValue(2)
         amp_layout.addWidget(self.fade_out_spin, 3, 1)
         self.btn_fade_out = QPushButton("Apply")
         amp_layout.addWidget(self.btn_fade_out, 3, 2)
 
         amp_layout.setColumnStretch(0, 1)
-        amp_layout.setColumnStretch(1, 1)
+        amp_layout.setColumnStretch(1, 2)
         amp_layout.setColumnStretch(2, 1)
+        fill_group(amp_group)
 
-        # Time Edit group
         time_group = QGroupBox("Time Edit")
         time_layout = QGridLayout(time_group)
-        time_layout.setVerticalSpacing(6)
+        time_layout.setVerticalSpacing(8)
         time_layout.setHorizontalSpacing(10)
 
         time_layout.addWidget(QLabel("Trim Start:"), 0, 0)
-        self.trim_start = QDoubleSpinBox()
-        self.trim_start.setRange(0, 3600)
-        self.trim_start.setValue(0)
+        self.trim_start = QDoubleSpinBox(); self.trim_start.setRange(0, 3600); self.trim_start.setValue(0)
         time_layout.addWidget(self.trim_start, 0, 1)
         time_layout.addWidget(QLabel("End:"), 0, 2)
-        self.trim_end = QDoubleSpinBox()
-        self.trim_end.setRange(0, 3600)
-        self.trim_end.setValue(5)
+        self.trim_end = QDoubleSpinBox(); self.trim_end.setRange(0, 3600); self.trim_end.setValue(5)
         time_layout.addWidget(self.trim_end, 0, 3)
         self.btn_trim = QPushButton("Apply Trim")
         time_layout.addWidget(self.btn_trim, 0, 4)
 
         self.btn_join = QPushButton("Join Audio")
-        self.btn_join.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         time_layout.addWidget(self.btn_join, 1, 0, 1, 5)
 
         time_layout.setColumnStretch(0, 1)
-        time_layout.setColumnStretch(1, 1)
+        time_layout.setColumnStretch(1, 2)
         time_layout.setColumnStretch(2, 1)
-        time_layout.setColumnStretch(3, 1)
+        time_layout.setColumnStretch(3, 2)
         time_layout.setColumnStretch(4, 1)
+        fill_group(time_group)
 
         basic_layout.addWidget(amp_group, 1)
         basic_layout.addWidget(time_group, 1)
         self.tab_widget.addTab(basic_tab, "Basic")
 
-        # ---------- Effects Tab ----------
+        # ========== Effects Tab ==========
         effects_tab = QWidget()
         effects_layout = QHBoxLayout(effects_tab)
         effects_layout.setContentsMargins(8, 8, 8, 8)
         effects_layout.setSpacing(12)
 
-        # Noise Reduction
         nr_group = QGroupBox("Noise Reduction")
         nr_layout = QGridLayout(nr_group)
-        nr_layout.setVerticalSpacing(6)
-        nr_layout.setHorizontalSpacing(8)
+        nr_layout.setVerticalSpacing(8)
+        nr_layout.setHorizontalSpacing(10)
         nr_layout.addWidget(QLabel("Method:"), 0, 0)
         self.nr_combo = QComboBox()
         self.nr_combo.addItems(["Time Smooth", "Notch 50Hz", "Notch 60Hz"])
         nr_layout.addWidget(self.nr_combo, 0, 1)
         self.btn_nr = QPushButton("Apply NR")
         nr_layout.addWidget(self.btn_nr, 0, 2)
-        nr_layout.setColumnStretch(1, 1)
+        nr_layout.setColumnStretch(0, 1)
+        nr_layout.setColumnStretch(1, 2)
+        nr_layout.setColumnStretch(2, 1)
+        fill_group(nr_group)
 
-        # Equalizer
         eq_group = QGroupBox("Equalizer")
         eq_layout = QGridLayout(eq_group)
-        eq_layout.setVerticalSpacing(6)
-        eq_layout.setHorizontalSpacing(8)
+        eq_layout.setVerticalSpacing(8)
+        eq_layout.setHorizontalSpacing(10)
+
         eq_layout.addWidget(QLabel("Low"), 0, 0)
         self.eq_low = QSlider(Qt.Orientation.Horizontal)
-        self.eq_low.setRange(-12, 12)
-        self.eq_low.setValue(0)
+        self.eq_low.setRange(-12, 12); self.eq_low.setValue(0)
         eq_layout.addWidget(self.eq_low, 0, 1)
+        self.lbl_eq_low = QLabel("0 dB")
+        self.lbl_eq_low.setObjectName("eqValue")
+        self.lbl_eq_low.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_eq_low.setMinimumWidth(55)
+        eq_layout.addWidget(self.lbl_eq_low, 0, 2)
+        self.eq_low.valueChanged.connect(self._update_eq_labels)
+
         eq_layout.addWidget(QLabel("Mid"), 1, 0)
         self.eq_mid = QSlider(Qt.Orientation.Horizontal)
-        self.eq_mid.setRange(-12, 12)
-        self.eq_mid.setValue(0)
+        self.eq_mid.setRange(-12, 12); self.eq_mid.setValue(0)
         eq_layout.addWidget(self.eq_mid, 1, 1)
+        self.lbl_eq_mid = QLabel("0 dB")
+        self.lbl_eq_mid.setObjectName("eqValue")
+        self.lbl_eq_mid.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_eq_mid.setMinimumWidth(55)
+        eq_layout.addWidget(self.lbl_eq_mid, 1, 2)
+        self.eq_mid.valueChanged.connect(self._update_eq_labels)
+
         eq_layout.addWidget(QLabel("High"), 2, 0)
         self.eq_high = QSlider(Qt.Orientation.Horizontal)
-        self.eq_high.setRange(-12, 12)
-        self.eq_high.setValue(0)
+        self.eq_high.setRange(-12, 12); self.eq_high.setValue(0)
         eq_layout.addWidget(self.eq_high, 2, 1)
-        self.btn_eq = QPushButton("Apply EQ")
-        eq_layout.addWidget(self.btn_eq, 3, 0, 1, 2)
-        eq_layout.setColumnStretch(1, 2)
+        self.lbl_eq_high = QLabel("0 dB")
+        self.lbl_eq_high.setObjectName("eqValue")
+        self.lbl_eq_high.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_eq_high.setMinimumWidth(55)
+        eq_layout.addWidget(self.lbl_eq_high, 2, 2)
+        self.eq_high.valueChanged.connect(self._update_eq_labels)
 
-        # Reverb & Echo
+        self.btn_eq = QPushButton("Apply EQ")
+        eq_layout.addWidget(self.btn_eq, 3, 0, 1, 3)
+
+        eq_layout.setColumnStretch(0, 1)
+        eq_layout.setColumnStretch(1, 6)
+        eq_layout.setColumnStretch(2, 2)
+        fill_group(eq_group)
+
         reverb_group = QGroupBox("Reverb / Echo")
         reverb_layout = QGridLayout(reverb_group)
-        reverb_layout.setVerticalSpacing(6)
-        reverb_layout.setHorizontalSpacing(8)
+        reverb_layout.setVerticalSpacing(8)
+        reverb_layout.setHorizontalSpacing(10)
 
         reverb_layout.addWidget(QLabel("Reverb Room (ms):"), 0, 0)
-        self.rev_size = QDoubleSpinBox()
-        self.rev_size.setRange(10, 500)
-        self.rev_size.setValue(100)
+        self.rev_size = QDoubleSpinBox(); self.rev_size.setRange(10, 500); self.rev_size.setValue(100)
         reverb_layout.addWidget(self.rev_size, 0, 1)
         reverb_layout.addWidget(QLabel("Decay:"), 0, 2)
-        self.rev_decay = QDoubleSpinBox()
-        self.rev_decay.setRange(0.1, 0.99)
-        self.rev_decay.setValue(0.5)
+        self.rev_decay = QDoubleSpinBox(); self.rev_decay.setRange(0.1, 0.99); self.rev_decay.setValue(0.5)
         reverb_layout.addWidget(self.rev_decay, 0, 3)
         self.btn_reverb = QPushButton("Apply Reverb")
         reverb_layout.addWidget(self.btn_reverb, 0, 4)
 
         reverb_layout.addWidget(QLabel("Echo Delay (s):"), 1, 0)
-        self.echo_delay = QDoubleSpinBox()
-        self.echo_delay.setRange(0.01, 2.0)
-        self.echo_delay.setValue(0.2)
+        self.echo_delay = QDoubleSpinBox(); self.echo_delay.setRange(0.01, 2.0); self.echo_delay.setValue(0.2)
         reverb_layout.addWidget(self.echo_delay, 1, 1)
         reverb_layout.addWidget(QLabel("Decay:"), 1, 2)
-        self.echo_decay = QDoubleSpinBox()
-        self.echo_decay.setRange(0.1, 0.9)
-        self.echo_decay.setValue(0.5)
+        self.echo_decay = QDoubleSpinBox(); self.echo_decay.setRange(0.1, 0.9); self.echo_decay.setValue(0.5)
         reverb_layout.addWidget(self.echo_decay, 1, 3)
         self.btn_echo = QPushButton("Apply Echo")
         reverb_layout.addWidget(self.btn_echo, 1, 4)
 
-        for c in range(5):
-            reverb_layout.setColumnStretch(c, 1)
+        reverb_layout.setColumnStretch(0, 2)
+        reverb_layout.setColumnStretch(1, 2)
+        reverb_layout.setColumnStretch(2, 1)
+        reverb_layout.setColumnStretch(3, 2)
+        reverb_layout.setColumnStretch(4, 3)
+        fill_group(reverb_group)
 
         effects_layout.addWidget(nr_group, 1)
         effects_layout.addWidget(eq_group, 2)
         effects_layout.addWidget(reverb_group, 2)
         self.tab_widget.addTab(effects_tab, "Effects")
 
-        # ---------- Remix Tab ----------
+        # ========== Remix Tab ==========
         remix_tab = QWidget()
         remix_layout = QVBoxLayout(remix_tab)
         remix_layout.setContentsMargins(8, 8, 8, 8)
         remix_layout.setSpacing(8)
 
+        # Load + preview row
         load_row = QHBoxLayout()
         self.btn_load_remix = QPushButton("Load Remix Clip")
         load_row.addWidget(self.btn_load_remix)
+
+        self.btn_preview_remix = QPushButton("Preview Remix")
+        self.btn_preview_remix.setEnabled(False)
+        self.btn_preview_remix.setToolTip("Play the remix clip alone so you can hear it")
+        load_row.addWidget(self.btn_preview_remix)
+
         self.lbl_remix_file = QLabel("No remix loaded")
-        load_row.addWidget(self.lbl_remix_file)
-        load_row.addStretch()
+        load_row.addWidget(self.lbl_remix_file, stretch=1)
         remix_layout.addLayout(load_row)
 
+        # Parameters group
         params_group = QGroupBox("Insert Parameters")
         params_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         params_grid = QGridLayout(params_group)
-        params_grid.setVerticalSpacing(6)
+        params_grid.setVerticalSpacing(8)
         params_grid.setHorizontalSpacing(10)
 
-        params_grid.addWidget(QLabel("Start (s):"), 0, 0)
-        self.remix_start = QDoubleSpinBox()
-        self.remix_start.setRange(0, 3600)
-        self.remix_start.setValue(0)
-        params_grid.addWidget(self.remix_start, 0, 1)
-        self.remix_use_full = QCheckBox("Full Clip")
-        self.remix_use_full.setChecked(True)
-        params_grid.addWidget(self.remix_use_full, 0, 2)
-        params_grid.addWidget(QLabel("Duration (s):"), 0, 3)
-        self.remix_duration = QDoubleSpinBox()
-        self.remix_duration.setRange(0.1, 3600)
-        self.remix_duration.setValue(2.0)
+        # --- Mode row ---
+        params_grid.addWidget(QLabel("Mode:"), 0, 0)
+        self.remix_mode = QComboBox()
+        self.remix_mode.addItems([
+            "Insert (splice in)",
+            "Replace (overwrite)",
+            "Superimpose (mix)",
+        ])
+        self.remix_mode.setCurrentIndex(0)
+        self.remix_mode.setToolTip(
+            "Insert: main track grows by the remix length\n"
+            "Replace: the remix overwrites a section of the main track (same length)\n"
+            "Superimpose: the remix is mixed on top of the main track"
+        )
+        params_grid.addWidget(self.remix_mode, 0, 1, 1, 5)
+
+        # --- Start / Full Clip / Duration ---
+        params_grid.addWidget(QLabel("Start (s):"), 1, 0)
+        self.remix_start = QDoubleSpinBox(); self.remix_start.setRange(0, 3600); self.remix_start.setValue(0)
+        params_grid.addWidget(self.remix_start, 1, 1)
+        self.remix_use_full = QCheckBox("Full Clip"); self.remix_use_full.setChecked(True)
+        params_grid.addWidget(self.remix_use_full, 1, 2)
+        params_grid.addWidget(QLabel("Duration (s):"), 1, 3)
+        self.remix_duration = QDoubleSpinBox(); self.remix_duration.setRange(0.1, 3600); self.remix_duration.setValue(2.0)
         self.remix_duration.setEnabled(False)
-        params_grid.addWidget(self.remix_duration, 0, 4)
+        params_grid.addWidget(self.remix_duration, 1, 4)
         self.remix_use_full.toggled.connect(lambda checked: self.remix_duration.setEnabled(not checked))
 
-        params_grid.addWidget(QLabel("Fade In (s):"), 1, 0)
-        self.remix_fade_in = QDoubleSpinBox()
-        self.remix_fade_in.setRange(0, 5)
-        self.remix_fade_in.setValue(0.5)
-        params_grid.addWidget(self.remix_fade_in, 1, 1)
-        params_grid.addWidget(QLabel("Fade Out:"), 1, 2)
-        self.remix_fade_out = QDoubleSpinBox()
-        self.remix_fade_out.setRange(0, 5)
-        self.remix_fade_out.setValue(0.5)
-        params_grid.addWidget(self.remix_fade_out, 1, 3)
-        params_grid.addWidget(QLabel("Gain:"), 1, 4)
-        self.remix_gain = QDoubleSpinBox()
-        self.remix_gain.setRange(0.0, 5.0)
-        self.remix_gain.setValue(1.0)
-        params_grid.addWidget(self.remix_gain, 1, 5)
+        # --- Fades and Gain ---
+        params_grid.addWidget(QLabel("Fade In (s):"), 2, 0)
+        self.remix_fade_in = QDoubleSpinBox(); self.remix_fade_in.setRange(0, 5); self.remix_fade_in.setValue(0.5)
+        params_grid.addWidget(self.remix_fade_in, 2, 1)
+        params_grid.addWidget(QLabel("Fade Out:"), 2, 2)
+        self.remix_fade_out = QDoubleSpinBox(); self.remix_fade_out.setRange(0, 5); self.remix_fade_out.setValue(0.5)
+        params_grid.addWidget(self.remix_fade_out, 2, 3)
+        params_grid.addWidget(QLabel("Gain:"), 2, 4)
+        self.remix_gain = QDoubleSpinBox(); self.remix_gain.setRange(0.0, 5.0); self.remix_gain.setValue(1.0)
+        params_grid.addWidget(self.remix_gain, 2, 5)
 
-        self.btn_insert_remix = QPushButton("Insert Remix")
-        params_grid.addWidget(self.btn_insert_remix, 2, 0, 1, 6)
+        # --- Action button ---
+        self.btn_insert_remix = QPushButton("Apply Remix")
+        params_grid.addWidget(self.btn_insert_remix, 3, 0, 1, 6)
 
         for c in range(6):
             params_grid.setColumnStretch(c, 1)
+        fill_group(params_group)
 
         remix_layout.addWidget(params_group, 1)
         self.tab_widget.addTab(remix_tab, "Remix")
 
-        # ---------- Analysis Tab ----------
+        # ========== Analysis Tab ==========
         analysis_tab = QWidget()
         analysis_layout = QGridLayout(analysis_tab)
         analysis_layout.setContentsMargins(8, 8, 8, 8)
@@ -558,20 +710,42 @@ class AudioWorkstation(QMainWindow):
         self.lbl_tempo = QLabel("Tempo: -- BPM")
         analysis_layout.addWidget(self.lbl_tempo, 0, 3)
 
-        analysis_layout.addWidget(QLabel("Resample to:"), 0, 4)
+        analysis_layout.addWidget(QLabel("Resample to:"), 1, 0)
         self.resample_combo = QComboBox()
-        self.resample_combo.addItems(["44100", "22050", "11025", "8000"])
-        analysis_layout.addWidget(self.resample_combo, 0, 5)
-        self.resample_aliasing = QCheckBox("Aliasing Demo")
-        analysis_layout.addWidget(self.resample_aliasing, 0, 6)
-        self.btn_resample = QPushButton("Apply Resample")
-        analysis_layout.addWidget(self.btn_resample, 0, 7)
+        self.resample_combo.addItems(["44100", "22050", "11025", "8000", "Custom"])
+        self.resample_combo.setCurrentIndex(0)
+        analysis_layout.addWidget(self.resample_combo, 1, 1)
 
-        for col in range(8):
+        self.custom_sr_spin = QDoubleSpinBox()
+        self.custom_sr_spin.setRange(100, 192000)
+        self.custom_sr_spin.setValue(48000)
+        self.custom_sr_spin.setDecimals(0)
+        self.custom_sr_spin.setSuffix(" Hz")
+        self.custom_sr_spin.setVisible(False)
+        analysis_layout.addWidget(self.custom_sr_spin, 1, 2)
+
+        self.resample_aliasing = QCheckBox("Aliasing Demo")
+        analysis_layout.addWidget(self.resample_aliasing, 1, 3)
+        self.btn_resample = QPushButton("Apply Resample")
+        analysis_layout.addWidget(self.btn_resample, 1, 4)
+
+        for col in range(5):
             analysis_layout.setColumnStretch(col, 1)
+
+        for w in (self.btn_pitch, self.lbl_pitch, self.btn_tempo, self.lbl_tempo,
+                  self.resample_combo, self.custom_sr_spin,
+                  self.resample_aliasing, self.btn_resample):
+            w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.lbl_pitch.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_tempo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.resample_combo.currentTextChanged.connect(
+            lambda text: self.custom_sr_spin.setVisible(text == "Custom")
+        )
 
         self.tab_widget.addTab(analysis_tab, "Analysis")
 
+        main_layout.addSpacing(14)
         main_layout.addWidget(self.tab_widget, stretch=4)
 
         # ---- Connect signals ----
@@ -591,7 +765,6 @@ class AudioWorkstation(QMainWindow):
         self.combo_zoom.currentTextChanged.connect(self.on_zoom_changed)
         self.combo_speed.currentTextChanged.connect(self.on_speed_changed)
 
-        # Basic editing
         self.btn_reverse.clicked.connect(self.apply_reverse)
         self.btn_scale.clicked.connect(self.apply_scale)
         self.btn_fade_in.clicked.connect(self.apply_fade_in)
@@ -599,20 +772,79 @@ class AudioWorkstation(QMainWindow):
         self.btn_trim.clicked.connect(self.apply_trim)
         self.btn_join.clicked.connect(self.apply_join)
 
-        # Advanced
         self.btn_nr.clicked.connect(self.apply_noise_reduction)
         self.btn_eq.clicked.connect(self.apply_eq)
         self.btn_reverb.clicked.connect(self.apply_reverb)
         self.btn_echo.clicked.connect(self.apply_echo)
 
-        # Remix
         self.btn_load_remix.clicked.connect(self.load_remix_clip)
+        self.btn_preview_remix.clicked.connect(self.preview_remix_clip)
         self.btn_insert_remix.clicked.connect(self.apply_remix)
 
-        # Analysis
         self.btn_pitch.clicked.connect(self.estimate_pitch)
         self.btn_tempo.clicked.connect(self.detect_tempo)
         self.btn_resample.clicked.connect(self.apply_resample)
+
+    # ------------------------------------------------------------------
+    # EQ label + Undo counter updaters
+    # ------------------------------------------------------------------
+    def _update_eq_labels(self):
+        for slider, label in ((self.eq_low, self.lbl_eq_low),
+                              (self.eq_mid, self.lbl_eq_mid),
+                              (self.eq_high, self.lbl_eq_high)):
+            v = slider.value()
+            label.setText(f"{v:+d} dB" if v != 0 else "0 dB")
+
+    def _update_undo_label(self):
+        n = len(self.undo_stack)
+        if n == 0:
+            self.lbl_undo_count.setText("")
+        elif n == 1:
+            self.lbl_undo_count.setText("(1 step)")
+        else:
+            self.lbl_undo_count.setText(f"({n} steps)")
+
+    # ------------------------------------------------------------------
+    # UI control reset helper
+    # ------------------------------------------------------------------
+    def _reset_ui_controls(self):
+        self.scale_spin.setValue(1.0)
+        self.fade_in_spin.setValue(2.0)
+        self.fade_out_spin.setValue(2.0)
+        self.trim_start.setValue(0.0)
+        self.trim_end.setValue(5.0)
+
+        self.nr_combo.setCurrentIndex(0)
+        self.eq_low.setValue(0)
+        self.eq_mid.setValue(0)
+        self.eq_high.setValue(0)
+        self._update_eq_labels()
+        self.rev_size.setValue(100)
+        self.rev_decay.setValue(0.5)
+        self.echo_delay.setValue(0.2)
+        self.echo_decay.setValue(0.5)
+
+        self.remix_mode.setCurrentIndex(0)
+        self.remix_start.setValue(0.0)
+        self.remix_use_full.setChecked(True)
+        self.remix_duration.setValue(2.0)
+        self.remix_duration.setEnabled(False)
+        self.remix_fade_in.setValue(0.5)
+        self.remix_fade_out.setValue(0.5)
+        self.remix_gain.setValue(1.0)
+
+        self.resample_combo.setCurrentIndex(0)
+        self.custom_sr_spin.setValue(48000)
+        self.custom_sr_spin.setVisible(False)
+        self.resample_aliasing.setChecked(False)
+        self.lbl_pitch.setText("Pitch: -- Hz")
+        self.lbl_tempo.setText("Tempo: -- BPM")
+
+        self.speed_factor = 1.0
+        self.combo_zoom.setCurrentText("1")
+        self.combo_speed.setCurrentText("1.0x")
+        self.show_spectrum.setChecked(False)
+        self.follow_playhead.setChecked(False)
 
     # ------------------------------------------------------------------
     # Core audio management
@@ -620,9 +852,28 @@ class AudioWorkstation(QMainWindow):
     def _update_audio_source(self):
         if self.current_audio is None:
             return
-        sf.write(self.temp_file, self.current_audio, self.sr)
+        self.player.stop()
+
+        if self.speed_factor != 1.0:
+            target_len = max(32, int(round(len(self.current_audio) / self.speed_factor)))
+            audio_to_write = resample(self.current_audio, target_len)
+            np.clip(audio_to_write, -1.0, 1.0, out=audio_to_write)
+        else:
+            audio_to_write = self.current_audio
+
+        try:
+            if os.path.exists(self.temp_file):
+                os.remove(self.temp_file)
+        except Exception:
+            pass
+
+        self.temp_counter += 1
+        self.temp_file = os.path.abspath(f"temp_edit_{self.temp_counter}.wav")
+
+        sf.write(self.temp_file, audio_to_write, self.sr)
         self.player.setSource(QUrl.fromLocalFile(self.temp_file))
-        self.duration = len(self.current_audio) / float(self.sr)
+
+        self.duration = len(audio_to_write) / float(self.sr)
         self.lbl_total_time.setText(format_time(self.duration))
         self.slider_progress.setRange(0, 1000)
         self.slider_progress.setValue(0)
@@ -633,8 +884,17 @@ class AudioWorkstation(QMainWindow):
     def _update_waveform(self, beat_times=None):
         if self.current_audio is None:
             return
-        time_axis = np.arange(len(self.current_audio)) / float(self.sr)
-        self.canvas.plot_signal(time_axis, self.current_audio, filename=self.current_filename, beat_times=beat_times)
+
+        if self.speed_factor != 1.0:
+            target_len = max(32, int(round(len(self.current_audio) / self.speed_factor)))
+            display_audio = resample(self.current_audio, target_len)
+        else:
+            display_audio = self.current_audio
+
+        time_axis = np.arange(len(display_audio)) / float(self.sr)
+        self.canvas.plot_signal(time_axis, display_audio,
+                                filename=self.current_filename,
+                                beat_times=beat_times)
         self.canvas.update_viewport(0, self.combo_zoom.currentText())
         if self.show_spectrum.isChecked():
             self.spectrum_canvas.plot_spectrum(self.current_audio, self.sr, "Spectrum")
@@ -649,6 +909,7 @@ class AudioWorkstation(QMainWindow):
     def push_undo(self):
         if self.current_audio is not None:
             self.undo_stack.append((self.current_audio.copy(), self.current_filename))
+        self._update_undo_label()
 
     def undo_last(self):
         if not self.undo_stack:
@@ -658,6 +919,7 @@ class AudioWorkstation(QMainWindow):
         self.current_audio = audio
         self.current_filename = filename
         self._update_all()
+        self._update_undo_label()
 
     def reset_audio(self):
         if self.original_audio is None:
@@ -665,14 +927,13 @@ class AudioWorkstation(QMainWindow):
             return
         self.push_undo()
         self.current_audio = self.original_audio.copy()
-        self.current_filename = os.path.basename(self.current_filename)
+        self.current_filename = self.original_filename
         self.undo_stack.clear()
+        self._update_undo_label()
         self._update_all()
-        QMessageBox.information(self, "Reset", "Audio reset.")
+        self._reset_ui_controls()
+        QMessageBox.information(self, "Reset", "Audio and controls reset.")
 
-    # ------------------------------------------------------------------
-    # Load / Save
-    # ------------------------------------------------------------------
     def load_audio(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Audio File", "", "Audio Files (*.wav *.flac *.ogg *.mp3);;All Files (*)"
@@ -687,7 +948,9 @@ class AudioWorkstation(QMainWindow):
             self.original_audio = data.copy()
             self.sr = sr
             self.current_filename = os.path.basename(file_path)
+            self.original_filename = self.current_filename
             self.undo_stack.clear()
+            self._update_undo_label()
             self._update_all()
             self.lbl_pitch.setText("Pitch: -- Hz")
             self.lbl_tempo.setText("Tempo: -- BPM")
@@ -695,6 +958,9 @@ class AudioWorkstation(QMainWindow):
             self.remix_audio = None
             self.remix_filename = ""
             self.lbl_remix_file.setText("No remix loaded")
+            self.btn_preview_remix.setEnabled(False)
+            self.previewing_remix = False
+            self._reset_ui_controls()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not read audio:\n{str(e)}")
 
@@ -713,9 +979,6 @@ class AudioWorkstation(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Save Error", str(e))
 
-    # ------------------------------------------------------------------
-    # Playback
-    # ------------------------------------------------------------------
     def play_audio(self):
         if self.current_audio is not None:
             self.player.play()
@@ -740,9 +1003,27 @@ class AudioWorkstation(QMainWindow):
         self.slider_progress.setValue(progress_val)
         self.slider_progress.blockSignals(False)
 
+        if (self.show_spectrum.isChecked() and self.follow_playhead.isChecked()
+                and self.current_audio is not None):
+            if abs(position_ms - self._last_spectrum_ms) >= self._spectrum_update_interval_ms:
+                self._last_spectrum_ms = position_ms
+                self.spectrum_canvas.plot_spectrum(
+                    self.current_audio, self.sr, "Spectrum (live)",
+                    center_time=elapsed_sec
+                )
+
     def on_state_changed(self, state):
         if state == QMediaPlayer.PlaybackState.StoppedState:
             self.canvas.hide_playhead()
+            if self.previewing_remix:
+                self.previewing_remix = False
+                self._update_audio_source()
+                self._update_waveform()
+                if self.remix_filename:
+                    self.lbl_remix_file.setText(
+                        f"Loaded: {self.remix_filename} "
+                        f"({len(self.remix_audio)} samples)"
+                    )
 
     def on_slider_pressed(self):
         self.user_is_scrubbing = True
@@ -752,6 +1033,12 @@ class AudioWorkstation(QMainWindow):
             target_time = (value / 1000.0) * self.duration
             self.lbl_current_time.setText(format_time(target_time))
             self.canvas.update_viewport(target_time, self.combo_zoom.currentText())
+            if (self.show_spectrum.isChecked() and self.follow_playhead.isChecked()
+                    and self.current_audio is not None):
+                self.spectrum_canvas.plot_spectrum(
+                    self.current_audio, self.sr, "Spectrum (live)",
+                    center_time=target_time
+                )
 
     def on_slider_released(self):
         self.user_is_scrubbing = False
@@ -764,17 +1051,34 @@ class AudioWorkstation(QMainWindow):
         self.canvas.update_viewport(elapsed_sec, text)
 
     def on_speed_changed(self, text):
-        speed = float(text.replace('x', ''))
-        self.player.setPlaybackRate(speed)
+        new_speed = float(text.replace('x', ''))
+        if new_speed == self.speed_factor:
+            return
+        rel_pos = 0.0
+        if self.duration > 0 and self.player.position() > 0:
+            rel_pos = self.player.position() / (self.duration * 1000.0)
+        self.speed_factor = new_speed
+        self._update_audio_source()
+        self._update_waveform()
+        if rel_pos > 0 and self.duration > 0:
+            self.player.setPosition(int(rel_pos * self.duration * 1000))
 
-    # ------------------------------------------------------------------
-    # Spectrum toggle
-    # ------------------------------------------------------------------
     def toggle_spectrum(self, state):
-        visible = (state == Qt.CheckState.Checked)
+        visible = (state != 0)
         self.spectrum_canvas.setVisible(visible)
+        self.follow_playhead.setEnabled(visible)
         if visible and self.current_audio is not None:
-            self.spectrum_canvas.plot_spectrum(self.current_audio, self.sr, "Spectrum")
+            if self.follow_playhead.isChecked():
+                t = self.player.position() / 1000.0
+                self.spectrum_canvas.plot_spectrum(
+                    self.current_audio, self.sr, "Spectrum (live)", center_time=t
+                )
+            else:
+                self.spectrum_canvas.plot_spectrum(self.current_audio, self.sr, "Spectrum")
+        self.spectrum_canvas.updateGeometry()
+        cw = self.centralWidget()
+        if cw is not None and cw.layout() is not None:
+            cw.layout().activate()
 
     # ------------------------------------------------------------------
     # Basic Editing
@@ -914,28 +1218,43 @@ class AudioWorkstation(QMainWindow):
         self._update_all()
 
     def apply_reverb(self):
-        if self.current_audio is None: return
+        if self.current_audio is None:
+            QMessageBox.warning(self, "No Audio", "Load audio first.")
+            return
         self.push_undo()
+
         room_size_ms = self.rev_size.value()
         decay = self.rev_decay.value()
         sr = self.sr
-        delay_samples = int(room_size_ms * sr / 1000.0)
-        num_reflections = 30
-        kernel_len = delay_samples * num_reflections + 1
+
+        effective_ms = min(room_size_ms, 400)
+        kernel_len = max(100, int(effective_ms * sr / 1000.0))
         kernel = np.zeros(kernel_len)
-        kernel[0] = 1.0
+
         np.random.seed(0)
-        for i in range(1, num_reflections):
-            offset = int(np.random.uniform(0, delay_samples))
-            idx = i * delay_samples + offset
-            if idx < kernel_len:
-                kernel[idx] = (decay ** i) * np.random.uniform(0.5, 1.0)
-        kernel = kernel / np.sum(np.abs(kernel))
-        convolved = np.convolve(self.current_audio, kernel, mode='same')
-        max_val = np.max(np.abs(convolved))
-        if max_val > 0:
-            convolved = convolved / max_val * 0.95
-        self.current_audio = convolved
+        early_fractions = [0.03, 0.07, 0.13, 0.19, 0.27, 0.37, 0.47, 0.59, 0.73, 0.89]
+        for i, frac in enumerate(early_fractions):
+            d = int(kernel_len * frac)
+            if 0 < d < kernel_len:
+                kernel[d] = (decay ** (i + 1)) * np.random.uniform(0.6, 1.0)
+
+        tail_start = int(kernel_len * 0.1)
+        if tail_start < kernel_len:
+            tail_len = kernel_len - tail_start
+            decay_rate = 3.0 * (1 - decay) + 0.5
+            env = np.exp(-decay_rate * np.linspace(0, 5, tail_len))
+            tail = np.random.randn(tail_len) * env * 0.25
+            kernel[tail_start:] += tail
+
+        kernel_energy = np.sqrt(np.sum(kernel ** 2))
+        if kernel_energy > 0:
+            kernel = kernel / kernel_energy * 0.5
+
+        wet = fftconvolve(self.current_audio, kernel, mode='same')
+        mixed = 0.6 * self.current_audio + 0.4 * wet
+        np.clip(mixed, -1.0, 1.0, out=mixed)
+
+        self.current_audio = mixed
         self.current_filename += " (reverb)"
         self._update_all()
 
@@ -944,13 +1263,15 @@ class AudioWorkstation(QMainWindow):
             QMessageBox.warning(self, "No Audio", "Load audio first.")
             return
         self.push_undo()
+
         delay_sec = self.echo_delay.value()
         decay = self.echo_decay.value()
         sr = self.sr
         delay_samples = int(delay_sec * sr)
         if delay_samples < 1:
             delay_samples = 1
-        num_repeats = 20
+
+        num_repeats = 12
         kernel_len = delay_samples * num_repeats + 1
         kernel = np.zeros(kernel_len)
         kernel[0] = 1.0
@@ -958,17 +1279,19 @@ class AudioWorkstation(QMainWindow):
             idx = i * delay_samples
             if idx < kernel_len:
                 kernel[idx] = decay ** i
-        kernel = kernel / np.sum(np.abs(kernel))
-        convolved = np.convolve(self.current_audio, kernel, mode='same')
+
+        convolved = fftconvolve(self.current_audio, kernel, mode='same')
+
         max_val = np.max(np.abs(convolved))
         if max_val > 0:
             convolved = convolved / max_val * 0.95
+
         self.current_audio = convolved
         self.current_filename += f" (echo {delay_sec}s, decay {decay})"
         self._update_all()
 
     # ------------------------------------------------------------------
-    # Remix (Insert)
+    # Remix
     # ------------------------------------------------------------------
     def load_remix_clip(self):
         if self.current_audio is None:
@@ -989,9 +1312,34 @@ class AudioWorkstation(QMainWindow):
             self.remix_audio = data
             self.remix_filename = os.path.basename(file_path)
             self.lbl_remix_file.setText(f"Loaded: {self.remix_filename} ({len(data)} samples)")
+            self.btn_preview_remix.setEnabled(True)
             QMessageBox.information(self, "Remix Loaded", f"Loaded {self.remix_filename}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not load remix:\n{str(e)}")
+
+    def preview_remix_clip(self):
+        if self.remix_audio is None:
+            QMessageBox.warning(self, "No Remix", "Load a remix clip first.")
+            return
+
+        self.player.stop()
+
+        self.temp_counter += 1
+        preview_file = os.path.abspath(f"temp_edit_{self.temp_counter}.wav")
+        sf.write(preview_file, self.remix_audio, self.sr)
+
+        self.previewing_remix = True
+
+        self.duration = len(self.remix_audio) / float(self.sr)
+        self.lbl_total_time.setText(format_time(self.duration))
+        self.slider_progress.setValue(0)
+
+        self.player.setSource(QUrl.fromLocalFile(preview_file))
+        self.player.play()
+
+        self.lbl_remix_file.setText(
+            f"▶ Previewing: {self.remix_filename} ({self.duration:.2f} s)"
+        )
 
     def apply_remix(self):
         if self.current_audio is None:
@@ -1007,6 +1355,7 @@ class AudioWorkstation(QMainWindow):
         fade_in = self.remix_fade_in.value()
         fade_out = self.remix_fade_out.value()
         gain = self.remix_gain.value()
+        mode = self.remix_mode.currentText()
 
         sr = self.sr
         start_sample = int(start_time * sr)
@@ -1015,6 +1364,7 @@ class AudioWorkstation(QMainWindow):
         if start_sample > len(self.current_audio):
             start_sample = len(self.current_audio)
 
+        # --- Build the remix segment (trim / gain / fades) ---
         if use_full:
             remix_segment = self.remix_audio.copy()
         else:
@@ -1039,13 +1389,42 @@ class AudioWorkstation(QMainWindow):
             remix_segment[-fade_out_samples:] *= fade_curve_out
 
         self.push_undo()
+
         left = self.current_audio[:start_sample]
-        right = self.current_audio[start_sample:]
-        new_audio = np.concatenate([left, remix_segment, right])
+
+        # --- Mode 1: Insert (splice in) ---
+        if mode.startswith("Insert"):
+            right = self.current_audio[start_sample:]
+            new_audio = np.concatenate([left, remix_segment, right])
+            self.current_filename += f" (remix inserted at {start_time:.1f}s)"
+
+        # --- Mode 2: Replace (overwrite) ---
+        elif mode.startswith("Replace"):
+            # The remix takes the place of len(remix_segment) samples of the main track
+            end_sample = start_sample + len(remix_segment)
+            if end_sample > len(self.current_audio):
+                # Remix extends past the end — clamp
+                end_sample = len(self.current_audio)
+                remix_segment = remix_segment[:end_sample - start_sample]
+            right = self.current_audio[end_sample:]
+            new_audio = np.concatenate([left, remix_segment, right])
+            self.current_filename += f" (remix replaced at {start_time:.1f}s)"
+
+        # --- Mode 3: Superimpose (mix on top) ---
+        else:
+            new_audio = self.current_audio.copy()
+            remix_end = start_sample + len(remix_segment)
+            if remix_end > len(new_audio):
+                # Extend the main track so the tail of the remix fits
+                extra = np.zeros(remix_end - len(new_audio))
+                new_audio = np.concatenate([new_audio, extra])
+            new_audio[start_sample:remix_end] += remix_segment
+            np.clip(new_audio, -1.0, 1.0, out=new_audio)
+            self.current_filename += f" (remix superimposed at {start_time:.1f}s)"
+
         self.current_audio = new_audio
-        self.current_filename += f" (remix inserted at {start_time:.1f}s)"
         self._update_all()
-        QMessageBox.information(self, "Remix Inserted", f"Inserted remix at {start_time:.1f}s")
+        QMessageBox.information(self, "Remix Applied", f"{mode} at {start_time:.1f}s")
 
     # ------------------------------------------------------------------
     # Analysis
@@ -1054,35 +1433,71 @@ class AudioWorkstation(QMainWindow):
         if self.current_audio is None:
             QMessageBox.warning(self, "No Audio", "Load audio first.")
             return
+
         audio = self.current_audio
         sr = self.sr
-        segment_len = int(0.5 * sr)
-        if len(audio) < segment_len:
-            segment = audio
-        else:
-            segment = audio[:segment_len]
-        segment = segment - np.mean(segment)
-        corr = np.correlate(segment, segment, mode='full')
-        corr = corr[len(corr)//2:]
-        min_lag = int(0.005 * sr)
-        max_lag = int(0.05 * sr)
-        if max_lag > len(corr):
-            max_lag = len(corr)-1
-        peaks = np.argmax(corr[min_lag:max_lag+1]) + min_lag
-        pitch_auto = sr / peaks if peaks > 0 else 0
 
-        fft = np.fft.rfft(segment)
-        freqs = np.fft.rfftfreq(len(segment), d=1/sr)
-        mag = np.abs(fft)
-        idx_min = np.argmax(freqs >= 50)
-        idx_max = np.argmax(freqs >= 2000)
-        if idx_max == 0:
-            idx_max = len(freqs)-1
-        peak_idx = np.argmax(mag[idx_min:idx_max]) + idx_min
-        pitch_fft = freqs[peak_idx]
+        frame_len = 2048
+        hop = 1024
+        min_lag = int(sr / 2000)
+        max_lag = int(sr / 50)
 
-        self.lbl_pitch.setText(f"Pitch: Auto={pitch_auto:.1f} Hz, FFT={pitch_fft:.1f} Hz")
-        QMessageBox.information(self, "Pitch Estimate", f"Autocorrelation: {pitch_auto:.1f} Hz\nFFT peak: {pitch_fft:.1f} Hz")
+        if len(audio) < frame_len * 2:
+            QMessageBox.warning(self, "Too Short",
+                                "Audio is too short for pitch analysis.")
+            return
+
+        n_frames = (len(audio) - frame_len) // hop + 1
+        times = np.zeros(n_frames)
+        pitches = np.full(n_frames, np.nan)
+
+        for i in range(n_frames):
+            start = i * hop
+            frame = audio[start:start + frame_len].astype(float)
+            frame = frame - np.mean(frame)
+            t = start / sr
+            times[i] = t
+
+            rms = np.sqrt(np.mean(frame ** 2))
+            if rms < 0.005:
+                continue
+
+            corr = np.correlate(frame, frame, mode='full')
+            corr = corr[len(corr) // 2:]
+
+            max_lag_use = min(max_lag, len(corr) - 1)
+            if min_lag >= max_lag_use:
+                continue
+
+            segment = corr[min_lag:max_lag_use + 1]
+            peak_idx = int(np.argmax(segment)) + min_lag
+
+            confidence = corr[peak_idx] / (corr[0] + 1e-12)
+            if confidence < 0.3:
+                continue
+
+            pitches[i] = sr / peak_idx
+
+        valid = ~np.isnan(pitches)
+        if not np.any(valid):
+            self.lbl_pitch.setText("Pitch: no clear pitch detected")
+            QMessageBox.information(self, "Pitch",
+                                    "No clearly pitched content found in this audio.")
+            return
+
+        valid_pitches = pitches[valid]
+        median_pitch = float(np.median(valid_pitches))
+
+        bins = np.round(valid_pitches / 5) * 5
+        values, counts = np.unique(bins, return_counts=True)
+        dominant_pitch = float(values[np.argmax(counts)])
+
+        self.lbl_pitch.setText(
+            f"Pitch: median={median_pitch:.1f} Hz, dominant={dominant_pitch:.1f} Hz"
+        )
+
+        dlg = PitchPlotDialog(times, pitches, median_pitch, dominant_pitch, self)
+        dlg.exec()
 
     def detect_tempo(self):
         if self.current_audio is None:
@@ -1126,14 +1541,24 @@ class AudioWorkstation(QMainWindow):
         if self.current_audio is None:
             QMessageBox.warning(self, "No Audio", "Load audio first.")
             return
-        new_sr = int(self.resample_combo.currentText())
+
+        text = self.resample_combo.currentText()
+        if text == "Custom":
+            new_sr = int(self.custom_sr_spin.value())
+        else:
+            new_sr = int(text)
+
+        if new_sr < 100 or new_sr > 192000:
+            QMessageBox.warning(self, "Resample", "Choose a rate between 100 and 192000 Hz.")
+            return
         if new_sr == self.sr:
             QMessageBox.information(self, "Resample", "Same sample rate.")
             return
+
         self.push_undo()
+
         if self.resample_aliasing.isChecked():
-            factor = self.sr // new_sr
-            if factor < 1: factor = 1
+            factor = max(1, self.sr // new_sr)
             resampled = self.current_audio[::factor]
             self.sr = new_sr
             self.current_audio = resampled
@@ -1144,6 +1569,7 @@ class AudioWorkstation(QMainWindow):
             self.sr = new_sr
             self.current_audio = resampled
             self.current_filename += f" (resampled {new_sr}Hz)"
+
         self._update_all()
         if self.show_spectrum.isChecked():
             self.spectrum_canvas.plot_spectrum(self.current_audio, self.sr, "Spectrum (after resample)")
