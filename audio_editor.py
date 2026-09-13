@@ -19,6 +19,8 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from scipy.signal import resample
 from scipy.signal import fftconvolve
 
+from jukebox_gui import JukeboxWindow
+
 DARK_STYLE = """
 QMainWindow { background-color: #0d0e12; }
 QWidget { background-color: #0d0e12; color: #e0e0e0; font-family: 'Helvetica', Arial, sans-serif; font-size: 12px; }
@@ -316,6 +318,8 @@ class AudioWorkstation(QMainWindow):
         self.remix_audio = None
         self.remix_filename = ""
         self.previewing_remix = False
+
+        self.jukebox_window = None
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -745,6 +749,39 @@ class AudioWorkstation(QMainWindow):
 
         self.tab_widget.addTab(analysis_tab, "Analysis")
 
+        # ========== Jukebox Tab ==========
+        jukebox_tab = QWidget()
+        jukebox_layout = QHBoxLayout(jukebox_tab)
+        jukebox_layout.setContentsMargins(8, 8, 8, 8)
+        jukebox_layout.setSpacing(12)
+
+        jukebox_group = QGroupBox("Infinite Jukebox")
+        jukebox_grid = QGridLayout(jukebox_group)
+        jukebox_grid.setVerticalSpacing(8)
+        jukebox_grid.setHorizontalSpacing(10)
+
+        lbl_jukebox = QLabel(
+            "Detects the beats of a song, finds beats that sound alike, and keeps the song "
+            "playing forever by jumping between them. The song is drawn as a circle with "
+            "arcs joining similar beats."
+        )
+        lbl_jukebox.setWordWrap(True)
+        jukebox_grid.addWidget(lbl_jukebox, 0, 0, 1, 2)
+
+        self.btn_jukebox_current = QPushButton("Open with Current Track")
+        self.btn_jukebox_current.setToolTip("Analyze the track loaded in the editor, including your edits")
+        jukebox_grid.addWidget(self.btn_jukebox_current, 1, 0)
+        self.btn_jukebox_open = QPushButton("Open Jukebox")
+        self.btn_jukebox_open.setToolTip("Open the jukebox and choose any song")
+        jukebox_grid.addWidget(self.btn_jukebox_open, 1, 1)
+
+        jukebox_grid.setColumnStretch(0, 1)
+        jukebox_grid.setColumnStretch(1, 1)
+        fill_group(jukebox_group)
+
+        jukebox_layout.addWidget(jukebox_group, 1)
+        self.tab_widget.addTab(jukebox_tab, "Jukebox")
+
         main_layout.addSpacing(14)
         main_layout.addWidget(self.tab_widget, stretch=4)
 
@@ -784,6 +821,9 @@ class AudioWorkstation(QMainWindow):
         self.btn_pitch.clicked.connect(self.estimate_pitch)
         self.btn_tempo.clicked.connect(self.detect_tempo)
         self.btn_resample.clicked.connect(self.apply_resample)
+
+        self.btn_jukebox_current.clicked.connect(self.open_jukebox_with_current)
+        self.btn_jukebox_open.clicked.connect(self.open_jukebox)
 
     # ------------------------------------------------------------------
     # EQ label + Undo counter updaters
@@ -981,6 +1021,8 @@ class AudioWorkstation(QMainWindow):
 
     def play_audio(self):
         if self.current_audio is not None:
+            if self.jukebox_window is not None:
+                self.jukebox_window.pause()
             self.player.play()
 
     def pause_audio(self):
@@ -1573,6 +1615,34 @@ class AudioWorkstation(QMainWindow):
         self._update_all()
         if self.show_spectrum.isChecked():
             self.spectrum_canvas.plot_spectrum(self.current_audio, self.sr, "Spectrum (after resample)")
+
+    # ------------------------------------------------------------------
+    # Infinite Jukebox
+    # ------------------------------------------------------------------
+    def _editor_track(self):
+        if self.current_audio is None:
+            return None
+        return self.current_audio, self.sr, self.current_filename
+
+    def open_jukebox(self):
+        if self.jukebox_window is None:
+            self.jukebox_window = JukeboxWindow(editor_track=self._editor_track)
+            self.jukebox_window.playbackStarted.connect(self.pause_audio)
+        self.jukebox_window.show()
+        self.jukebox_window.raise_()
+        self.jukebox_window.activateWindow()
+        return self.jukebox_window
+
+    def open_jukebox_with_current(self):
+        if self.current_audio is None:
+            QMessageBox.warning(self, "No Audio", "Load audio first.")
+            return
+        self.open_jukebox().load_track(*self._editor_track())
+
+    def closeEvent(self, event):
+        if self.jukebox_window is not None:
+            self.jukebox_window.close()
+        super().closeEvent(event)
 
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
