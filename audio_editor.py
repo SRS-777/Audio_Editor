@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QDialog
 )
 from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput,QMediaDevices
 from scipy.signal import resample
 from scipy.signal import fftconvolve
 
@@ -298,6 +298,14 @@ class AudioWorkstation(QMainWindow):
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
 
+        # Explicitly bind to whatever macOS says is the current default
+        # (Qt's QAudioOutput() alone doesn't always do this correctly)
+        default_device = QMediaDevices.defaultAudioOutput()
+        if default_device is not None:
+            self.audio_output.setDevice(default_device)
+            print(f"[audio] Bound to: {default_device.description()}")
+        else:
+            print("[audio] No default device found — using Qt's choice")
         self.duration = 0.0
         self.user_is_scrubbing = False
         self.current_audio = None
@@ -1212,28 +1220,139 @@ class AudioWorkstation(QMainWindow):
     # Advanced Effects
     # ------------------------------------------------------------------
     def apply_noise_reduction(self):
-        if self.current_audio is None: return
+        if self.current_audio is None:
+            return
+
         method = self.nr_combo.currentText()
         self.push_undo()
+
         if "Time" in method:
-            window = int(0.01 * self.sr)
-            if window < 1: window = 1
-            kernel = np.ones(window) / window
-            filtered = np.convolve(self.current_audio, kernel, mode='same')
-            self.current_audio = filtered
-            self.current_filename += " (NR time)"
+            audio = self.current_audio.astype(float)
+            sr = self.sr
+
+            frame_len = 2048
+            hop = 512
+            window = np.hanning(frame_len)
+
+            n_frames = int(np.ceil(
+                (len(audio) - frame_len) / hop
+            )) + 1
+            n_frames = max(1, n_frames)
+
+            padded_len = (n_frames - 1) * hop + frame_len
+
+            padded = np.pad(
+                audio,
+                (0, max(0, padded_len - len(audio)))
+            )
+
+            stft = np.zeros(
+                (n_frames, frame_len // 2 + 1),
+                dtype=np.complex128
+            )
+
+            for i in range(n_frames):
+                start = i * hop
+                frame = padded[start:start + frame_len]
+                stft[i] = np.fft.rfft(frame * window)
+
+            magnitude = np.abs(stft)
+
+            noise_frames = max(1, min(
+                n_frames // 10,
+                int(1.0 * sr / hop)
+            ))
+
+            noise_profile = np.median(
+                magnitude[:noise_frames],
+                axis=0
+            )
+
+            alpha = 1.5
+            beta = 0.05
+
+            cleaned_magnitude = (
+                magnitude - alpha * noise_profile[None, :]
+            )
+
+            cleaned_magnitude = np.maximum(
+                cleaned_magnitude,
+                beta * noise_profile[None, :]
+            )
+
+            phase = np.exp(1j * np.angle(stft))
+
+            cleaned_stft = (
+                cleaned_magnitude * phase
+            )
+
+            out = np.zeros(padded_len)
+            window_sum = np.zeros(padded_len)
+
+            for i in range(n_frames):
+                start = i * hop
+
+                frame = np.fft.irfft(
+                    cleaned_stft[i],
+                    n=frame_len
+                )
+
+                frame *= window
+
+                out[start:start + frame_len] += frame
+                window_sum[start:start + frame_len] += window ** 2
+
+            valid = window_sum > 1e-10
+            out[valid] /= window_sum[valid]
+
+            out = out[:len(audio)]
+
+            out = np.clip(out, -1.0, 1.0)
+
+            self.current_audio = out
+            self.current_filename += " (NR spectral)"
+
         else:
             freq = 50 if "50" in method else 60
-            fft = np.fft.rfft(self.current_audio)
-            freqs = np.fft.rfftfreq(len(self.current_audio), d=1/self.sr)
-            notch_width = 2
-            indices = np.where((freqs >= freq - notch_width) & (freqs <= freq + notch_width))[0]
-            fft[indices] = 0
-            indices2 = np.where((freqs >= 2*freq - notch_width) & (freqs <= 2*freq + notch_width))[0]
-            fft[indices2] = 0
-            filtered = np.fft.irfft(fft)
+
+            audio = self.current_audio.astype(float)
+
+            fft = np.fft.rfft(audio)
+            freqs = np.fft.rfftfreq(
+                len(audio),
+                d=1 / self.sr
+            )
+
+            notch_width = 2.0
+
+            harmonics = range(
+                1,
+                int((self.sr / 2) // freq) + 1
+            )
+
+            for harmonic in harmonics:
+                target = harmonic * freq
+
+                indices = np.abs(
+                    freqs - target
+                ) <= notch_width
+
+                fft[indices] = 0
+
+            filtered = np.fft.irfft(
+                fft,
+                n=len(audio)
+            )
+
+            filtered = np.clip(
+                filtered,
+                -1.0,
+                1.0
+            )
+
             self.current_audio = filtered
             self.current_filename += " (NR freq)"
+
         self._update_all()
 
     def apply_eq(self):
@@ -1476,69 +1595,208 @@ class AudioWorkstation(QMainWindow):
             QMessageBox.warning(self, "No Audio", "Load audio first.")
             return
 
-        audio = self.current_audio
+        audio = self.current_audio.astype(float)
         sr = self.sr
-
         frame_len = 2048
-        hop = 1024
-        min_lag = int(sr / 2000)
-        max_lag = int(sr / 50)
+        hop = 512
+        min_freq = 50.0
+        max_freq = 400.0
+        min_lag = int(sr / max_freq)
+        max_lag = int(sr / min_freq)
 
-        if len(audio) < frame_len * 2:
-            QMessageBox.warning(self, "Too Short",
-                                "Audio is too short for pitch analysis.")
+        if len(audio) < frame_len:
+            QMessageBox.warning(
+                self,
+                "Too Short",
+                "Audio is too short for pitch analysis."
+            )
             return
 
-        n_frames = (len(audio) - frame_len) // hop + 1
+        n_frames = 1 + (len(audio) - frame_len) // hop
+
         times = np.zeros(n_frames)
         pitches = np.full(n_frames, np.nan)
 
         for i in range(n_frames):
+
             start = i * hop
-            frame = audio[start:start + frame_len].astype(float)
+            frame = audio[start:start + frame_len]
+
+            times[i] = start / sr
+
+            # Remove DC component
             frame = frame - np.mean(frame)
-            t = start / sr
-            times[i] = t
 
             rms = np.sqrt(np.mean(frame ** 2))
-            if rms < 0.005:
+
+            if rms < 1e-3:
                 continue
 
-            corr = np.correlate(frame, frame, mode='full')
-            corr = corr[len(corr) // 2:]
+            window = np.hanning(frame_len)
+            frame = frame * window
 
+            corr = np.correlate(frame, frame, mode="full")
+
+            # Keep non-negative lags
+            corr = corr[frame_len - 1:]
+
+            if corr[0] <= 0:
+                continue
+
+            # Normalize autocorrelation
+            corr = corr / corr[0]
+
+            # Make sure lag range is valid
             max_lag_use = min(max_lag, len(corr) - 1)
+
             if min_lag >= max_lag_use:
                 continue
 
-            segment = corr[min_lag:max_lag_use + 1]
-            peak_idx = int(np.argmax(segment)) + min_lag
+            candidates = []
 
-            confidence = corr[peak_idx] / (corr[0] + 1e-12)
-            if confidence < 0.3:
+            for lag in range(min_lag + 1, max_lag_use):
+
+                if (corr[lag] > corr[lag - 1] and
+                        corr[lag] >= corr[lag + 1]):
+
+                    candidates.append(lag)
+
+            if not candidates:
                 continue
 
-            pitches[i] = sr / peak_idx
+
+            peak_lag = max(
+                candidates,
+                key=lambda lag: corr[lag]
+            )
+
+            peak_value = corr[peak_lag]
+
+            if peak_value < 0.30:
+                continue
+            if 1 <= peak_lag < len(corr) - 1:
+
+                a = corr[peak_lag - 1]
+                b = corr[peak_lag]
+                c = corr[peak_lag + 1]
+
+                denominator = a - 2 * b + c
+
+                if abs(denominator) > 1e-12:
+                    delta = 0.5 * (a - c) / denominator
+                else:
+                    delta = 0.0
+
+                refined_lag = peak_lag + delta
+
+            else:
+                refined_lag = float(peak_lag)
+
+ 
+            half_lag = refined_lag / 2.0
+
+            if half_lag >= min_lag:
+
+                h = int(round(half_lag))
+
+                if h > min_lag and h < len(corr) - 1:
+
+                    half_value = corr[h]
+
+                    if half_value >= 0.85 * peak_value:
+                        refined_lag = half_lag
+
+            pitch = sr / refined_lag
+
+            # Final frequency sanity check
+            if min_freq <= pitch <= max_freq:
+                pitches[i] = pitch
+
+
+        valid_mask = ~np.isnan(pitches)
+
+        if np.sum(valid_mask) >= 5:
+
+            valid_indices = np.where(valid_mask)[0]
+
+            # Fill gaps temporarily for filtering
+            filled = pitches.copy()
+
+            for idx in np.where(~valid_mask)[0]:
+
+                nearest = valid_indices[
+                    np.argmin(np.abs(valid_indices - idx))
+                ]
+
+                filled[idx] = pitches[nearest]
+
+            # Simple median filter implemented manually
+            filtered = filled.copy()
+
+            for i in range(2, len(filled) - 2):
+
+                values = filled[i - 2:i + 3]
+
+                filtered[i] = np.median(values)
+
+            # Restore unvoiced frames
+            pitches = np.where(
+                valid_mask,
+                filtered,
+                np.nan
+            )
+
 
         valid = ~np.isnan(pitches)
+
         if not np.any(valid):
-            self.lbl_pitch.setText("Pitch: no clear pitch detected")
-            QMessageBox.information(self, "Pitch",
-                                    "No clearly pitched content found in this audio.")
+
+            self.lbl_pitch.setText(
+                "Pitch: no clear pitch detected"
+            )
+
+            QMessageBox.information(
+                self,
+                "Pitch",
+                "No clearly pitched content was detected.\n"
+                "This can happen with silence, noise, percussion, "
+                "or polyphonic audio."
+            )
+
             return
 
+
         valid_pitches = pitches[valid]
-        median_pitch = float(np.median(valid_pitches))
 
-        bins = np.round(valid_pitches / 5) * 5
-        values, counts = np.unique(bins, return_counts=True)
-        dominant_pitch = float(values[np.argmax(counts)])
-
-        self.lbl_pitch.setText(
-            f"Pitch: median={median_pitch:.1f} Hz, dominant={dominant_pitch:.1f} Hz"
+        median_pitch = float(
+            np.median(valid_pitches)
         )
 
-        dlg = PitchPlotDialog(times, pitches, median_pitch, dominant_pitch, self)
+        bins = np.round(valid_pitches / 5.0) * 5.0
+
+        values, counts = np.unique(
+            bins,
+            return_counts=True
+        )
+
+        dominant_pitch = float(
+            values[np.argmax(counts)]
+        )
+
+
+        self.lbl_pitch.setText(
+            f"Pitch: median={median_pitch:.1f} Hz, "
+            f"dominant={dominant_pitch:.1f} Hz"
+        )
+
+
+        dlg = PitchPlotDialog(
+            times,
+            pitches,
+            median_pitch,
+            dominant_pitch,
+            self
+        )
         dlg.exec()
 
     def detect_tempo(self):
