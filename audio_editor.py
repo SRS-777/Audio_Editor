@@ -90,7 +90,74 @@ QTabBar::tab:hover {
     padding: 0 4px;
 }
 """
+def _spectral_gate(audio, sr,
+                   frame_len=2048, hop=512,
+                   quiet_fraction=0.10,
+                   over_subtraction=3.0,
+                   spectral_floor=0.01,
+                   time_smoothing=0.70):
+    audio = audio.astype(np.float64)
+    n = len(audio)
+    if n < frame_len * 2:
+        return audio.copy()
 
+    window = np.hanning(frame_len)
+
+    # STFT
+    n_frames = 1 + (n - frame_len) // hop
+    padded_len = (n_frames - 1) * hop + frame_len
+    padded = np.pad(audio, (0, max(0, padded_len - n)))
+
+    stft = np.zeros((n_frames, frame_len // 2 + 1), dtype=np.complex128)
+    for i in range(n_frames):
+        s = i * hop
+        stft[i] = np.fft.rfft(padded[s:s + frame_len] * window)
+
+    power = np.abs(stft) ** 2
+
+    # --- Noise estimate: median of the quietest frames, per bin ---
+    frame_energy = np.sum(power, axis=1)
+    n_quiet = max(1, int(n_frames * quiet_fraction))
+    quiet_idx = np.argsort(frame_energy)[:n_quiet]
+    noise_psd = np.median(power[quiet_idx], axis=0)
+
+    # Smooth across frequency (noise is spectrally smooth)
+    k = np.array([1., 2., 3., 2., 1.]); k /= k.sum()
+    noise_psd = np.convolve(noise_psd, k, mode='same')
+    noise_psd = np.maximum(noise_psd, 1e-12)
+
+    # --- Spectral subtraction gain ---
+    # G = max(floor, 1 - a*N/P).  When P << N, G -> floor (near zero).
+    snr = power / noise_psd[None, :]
+    gain = np.maximum(spectral_floor, 1.0 - over_subtraction / snr)
+    gain = np.clip(gain, 0.0, 1.0)
+
+    # Smooth gain over time (kills musical noise)
+    for i in range(1, n_frames):
+        gain[i] = time_smoothing * gain[i - 1] + (1 - time_smoothing) * gain[i]
+
+    # Smooth gain across frequency
+    for _ in range(2):
+        gain = np.apply_along_axis(
+            lambda row: np.convolve(row, k, mode='same'), 1, gain
+        )
+    gain = np.clip(gain, 0.0, 1.0)
+
+    # --- Inverse STFT (overlap-add) ---
+    cleaned = stft * gain
+    out = np.zeros(padded_len)
+    win_sum = np.zeros(padded_len)
+    for i in range(n_frames):
+        s = i * hop
+        frame = np.fft.irfft(cleaned[i], n=frame_len)
+        out[s:s + frame_len] += frame * window
+        win_sum[s:s + frame_len] += window ** 2
+
+    valid = win_sum > 1e-10
+    out[valid] /= win_sum[valid]
+    out = out[:n]
+
+    return np.clip(out, -1.0, 1.0)
 def format_time(seconds):
     if seconds is None or seconds < 0: return "00:00"
     mins = int(seconds // 60); secs = int(seconds % 60)
@@ -310,6 +377,7 @@ class AudioWorkstation(QMainWindow):
         self.user_is_scrubbing = False
         self.current_audio = None
         self.original_audio = None
+        self.display_audio = None
         self.sr = None
         self.current_filename = ""
         self.original_filename = ""
@@ -319,6 +387,7 @@ class AudioWorkstation(QMainWindow):
         self.beat_times = None
 
         self.speed_factor = 1.0
+        self.display_audio = None
 
         self._last_spectrum_ms = -1
         self._spectrum_update_interval_ms = 50
@@ -804,6 +873,8 @@ class AudioWorkstation(QMainWindow):
 
         self.player.positionChanged.connect(self.on_position_changed)
         self.player.playbackStateChanged.connect(self.on_state_changed)
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.slider_progress.sliderPressed.connect(self.on_slider_pressed)
         self.slider_progress.sliderReleased.connect(self.on_slider_released)
         self.slider_progress.valueChanged.connect(self.on_slider_value_changed)
@@ -900,14 +971,30 @@ class AudioWorkstation(QMainWindow):
     def _update_audio_source(self):
         if self.current_audio is None:
             return
+
         self.player.stop()
 
         if self.speed_factor != 1.0:
-            target_len = max(32, int(round(len(self.current_audio) / self.speed_factor)))
-            audio_to_write = resample(self.current_audio, target_len)
-            np.clip(audio_to_write, -1.0, 1.0, out=audio_to_write)
+            target_len = max(
+                32,
+                int(round(
+                    len(self.current_audio) / self.speed_factor
+                ))
+            )
+
+            self.display_audio = resample(
+                self.current_audio,
+                target_len
+            )
+
+            np.clip(
+                self.display_audio,
+                -1.0,
+                1.0,
+                out=self.display_audio
+            )
         else:
-            audio_to_write = self.current_audio
+            self.display_audio = self.current_audio.copy()
 
         try:
             if os.path.exists(self.temp_file):
@@ -916,36 +1003,67 @@ class AudioWorkstation(QMainWindow):
             pass
 
         self.temp_counter += 1
-        self.temp_file = os.path.abspath(f"temp_edit_{self.temp_counter}.wav")
+        self.temp_file = os.path.abspath(
+            f"temp_edit_{self.temp_counter}.wav"
+        )
 
-        sf.write(self.temp_file, audio_to_write, self.sr)
-        self.player.setSource(QUrl.fromLocalFile(self.temp_file))
+        sf.write(
+            self.temp_file,
+            self.display_audio,
+            self.sr
+        )
 
-        self.duration = len(audio_to_write) / float(self.sr)
-        self.lbl_total_time.setText(format_time(self.duration))
+        self.player.setSource(
+            QUrl.fromLocalFile(self.temp_file)
+        )
+
+        self.duration = (
+            len(self.display_audio) / float(self.sr)
+        )
+
+        self.lbl_total_time.setText(
+            format_time(self.duration)
+        )
+
         self.slider_progress.setRange(0, 1000)
         self.slider_progress.setValue(0)
+
         self.lbl_info.setText(
-            f"{self.current_filename} | {len(self.current_audio)} samples | {self.sr} Hz"
+            f"{self.current_filename} | "
+            f"{len(self.current_audio)} samples | "
+            f"{self.sr} Hz"
         )
 
     def _update_waveform(self, beat_times=None):
         if self.current_audio is None:
             return
 
-        if self.speed_factor != 1.0:
-            target_len = max(32, int(round(len(self.current_audio) / self.speed_factor)))
-            display_audio = resample(self.current_audio, target_len)
-        else:
-            display_audio = self.current_audio
+        if self.display_audio is None:
+            self.display_audio = self.current_audio.copy()
 
-        time_axis = np.arange(len(display_audio)) / float(self.sr)
-        self.canvas.plot_signal(time_axis, display_audio,
-                                filename=self.current_filename,
-                                beat_times=beat_times)
-        self.canvas.update_viewport(0, self.combo_zoom.currentText())
+        time_axis = (
+            np.arange(len(self.display_audio))
+            / float(self.sr)
+        )
+
+        self.canvas.plot_signal(
+            time_axis,
+            self.display_audio,
+            filename=self.current_filename,
+            beat_times=beat_times
+        )
+
+        self.canvas.update_viewport(
+            0,
+            self.combo_zoom.currentText()
+        )
+
         if self.show_spectrum.isChecked():
-            self.spectrum_canvas.plot_spectrum(self.current_audio, self.sr, "Spectrum")
+            self.spectrum_canvas.plot_spectrum(
+                self.display_audio,
+                self.sr,
+                "Spectrum"
+            )
 
     def _update_all(self):
         self.stop_audio()
@@ -1101,18 +1219,58 @@ class AudioWorkstation(QMainWindow):
         self.canvas.update_viewport(elapsed_sec, text)
 
     def on_speed_changed(self, text):
+        
         new_speed = float(text.replace('x', ''))
+
         if new_speed == self.speed_factor:
             return
+
+        was_playing = (
+            self.player.playbackState()
+            == QMediaPlayer.PlaybackState.PlayingState
+        )
+
         rel_pos = 0.0
-        if self.duration > 0 and self.player.position() > 0:
-            rel_pos = self.player.position() / (self.duration * 1000.0)
+
+        if self.duration > 0:
+            rel_pos = (
+                self.player.position()
+                / (self.duration * 1000.0)
+            )
+
         self.speed_factor = new_speed
+
         self._update_audio_source()
         self._update_waveform()
-        if rel_pos > 0 and self.duration > 0:
-            self.player.setPosition(int(rel_pos * self.duration * 1000))
 
+        new_position = int(
+            rel_pos * self.duration * 1000.0
+        )
+
+        self.player.setPosition(new_position)
+
+        if was_playing:
+            self.player.play()
+    def on_media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+
+            self.player.stop()
+
+            if self.duration > 0:
+                self.canvas.update_viewport(
+                    self.duration,
+                    self.combo_zoom.currentText()
+                )
+
+            self.slider_progress.blockSignals(True)
+            self.slider_progress.setValue(1000)
+            self.slider_progress.blockSignals(False)
+
+            self.lbl_current_time.setText(
+                format_time(self.duration)
+            )
+
+        self.canvas.hide_playhead()        
     def toggle_spectrum(self, state):
         visible = (state != 0)
         self.spectrum_canvas.setVisible(visible)
@@ -1227,128 +1385,36 @@ class AudioWorkstation(QMainWindow):
         self.push_undo()
 
         if "Time" in method:
-            audio = self.current_audio.astype(float)
-            sr = self.sr
-
-            frame_len = 2048
-            hop = 512
-            window = np.hanning(frame_len)
-
-            n_frames = int(np.ceil(
-                (len(audio) - frame_len) / hop
-            )) + 1
-            n_frames = max(1, n_frames)
-
-            padded_len = (n_frames - 1) * hop + frame_len
-
-            padded = np.pad(
-                audio,
-                (0, max(0, padded_len - len(audio)))
-            )
-
-            stft = np.zeros(
-                (n_frames, frame_len // 2 + 1),
-                dtype=np.complex128
-            )
-
-            for i in range(n_frames):
-                start = i * hop
-                frame = padded[start:start + frame_len]
-                stft[i] = np.fft.rfft(frame * window)
-
-            magnitude = np.abs(stft)
-
-            noise_frames = max(1, min(
-                n_frames // 10,
-                int(1.0 * sr / hop)
-            ))
-
-            noise_profile = np.median(
-                magnitude[:noise_frames],
-                axis=0
-            )
-
-            alpha = 1.5
-            beta = 0.05
-
-            cleaned_magnitude = (
-                magnitude - alpha * noise_profile[None, :]
-            )
-
-            cleaned_magnitude = np.maximum(
-                cleaned_magnitude,
-                beta * noise_profile[None, :]
-            )
-
-            phase = np.exp(1j * np.angle(stft))
-
-            cleaned_stft = (
-                cleaned_magnitude * phase
-            )
-
-            out = np.zeros(padded_len)
-            window_sum = np.zeros(padded_len)
-
-            for i in range(n_frames):
-                start = i * hop
-
-                frame = np.fft.irfft(
-                    cleaned_stft[i],
-                    n=frame_len
-                )
-
-                frame *= window
-
-                out[start:start + frame_len] += frame
-                window_sum[start:start + frame_len] += window ** 2
-
-            valid = window_sum > 1e-10
-            out[valid] /= window_sum[valid]
-
-            out = out[:len(audio)]
-
-            out = np.clip(out, -1.0, 1.0)
-
-            self.current_audio = out
+            # ------------------------------------------------------------
+            # Time Smooth -> Wiener-style spectral gate.
+            # Uses per-bin noise-floor estimation across the whole file, so
+            # it works whether or not the track has a noise-only lead-in.
+            # ------------------------------------------------------------
+            self.current_audio = _spectral_gate(self.current_audio, self.sr)
             self.current_filename += " (NR spectral)"
 
         else:
+            # ------------------------------------------------------------
+            # Notch 50 Hz / 60 Hz -> zero out the fundamental and all
+            # harmonics of the mains hum up to Nyquist.
+            # ------------------------------------------------------------
             freq = 50 if "50" in method else 60
 
             audio = self.current_audio.astype(float)
 
             fft = np.fft.rfft(audio)
-            freqs = np.fft.rfftfreq(
-                len(audio),
-                d=1 / self.sr
-            )
+            freqs = np.fft.rfftfreq(len(audio), d=1 / self.sr)
 
             notch_width = 2.0
 
-            harmonics = range(
-                1,
-                int((self.sr / 2) // freq) + 1
-            )
-
+            harmonics = range(1, int((self.sr / 2) // freq) + 1)
             for harmonic in harmonics:
                 target = harmonic * freq
-
-                indices = np.abs(
-                    freqs - target
-                ) <= notch_width
-
+                indices = np.abs(freqs - target) <= notch_width
                 fft[indices] = 0
 
-            filtered = np.fft.irfft(
-                fft,
-                n=len(audio)
-            )
-
-            filtered = np.clip(
-                filtered,
-                -1.0,
-                1.0
-            )
+            filtered = np.fft.irfft(fft, n=len(audio))
+            filtered = np.clip(filtered, -1.0, 1.0)
 
             self.current_audio = filtered
             self.current_filename += " (NR freq)"
@@ -1356,24 +1422,37 @@ class AudioWorkstation(QMainWindow):
         self._update_all()
 
     def apply_eq(self):
-        if self.current_audio is None: return
-        low_gain = self.eq_low.value() / 10.0
-        mid_gain = self.eq_mid.value() / 10.0
-        high_gain = self.eq_high.value() / 10.0
+        if self.current_audio is None:
+            return
+
+        low_gain  = self.eq_low.value()  / 20.0
+        mid_gain  = self.eq_mid.value()  / 20.0
+        high_gain = self.eq_high.value() / 20.0
+
         self.push_undo()
-        fft = np.fft.rfft(self.current_audio)
-        freqs = np.fft.rfftfreq(len(self.current_audio), d=1/self.sr)
-        low_mask = freqs < 200
-        mid_mask = (freqs >= 200) & (freqs <= 2000)
+
+        fft   = np.fft.rfft(self.current_audio)
+        freqs = np.fft.rfftfreq(len(self.current_audio), d=1 / self.sr)
+
+        low_mask  = freqs < 200
+        mid_mask  = (freqs >= 200) & (freqs <= 2000)
         high_mask = freqs > 2000
-        gain_linear_low = 10**(low_gain)
-        gain_linear_mid = 10**(mid_gain)
-        gain_linear_high = 10**(high_gain)
-        fft[low_mask] *= gain_linear_low
-        fft[mid_mask] *= gain_linear_mid
+
+        gain_linear_low  = 10 ** low_gain
+        gain_linear_mid  = 10 ** mid_gain
+        gain_linear_high = 10 ** high_gain
+
+        fft[low_mask]  *= gain_linear_low
+        fft[mid_mask]  *= gain_linear_mid
         fft[high_mask] *= gain_linear_high
+
         filtered = np.fft.irfft(fft)
-        np.clip(filtered, -1.0, 1.0, out=filtered)
+
+        # ---- prevent clipping the way a real EQ would ----
+        peak = np.max(np.abs(filtered))
+        if peak > 0.99:
+            filtered = filtered / peak * 0.99
+
         self.current_audio = filtered
         self.current_filename += " (EQ)"
         self._update_all()
@@ -1803,40 +1882,169 @@ class AudioWorkstation(QMainWindow):
         if self.current_audio is None:
             QMessageBox.warning(self, "No Audio", "Load audio first.")
             return
-        audio = self.current_audio
+
+        audio = self.current_audio.astype(float)
         sr = self.sr
-        hop = int(0.01 * sr)
-        if hop < 1: hop = 1
+
+        # ------------------------------------------------------------
+        # Ignore the first 1 second because it contains noise-only audio
+        # ------------------------------------------------------------
+        start_sample = int(1.0 * sr)
+
+        if len(audio) <= start_sample:
+            QMessageBox.warning(self, "Tempo", "Audio is too short.")
+            return
+
+        audio = audio[start_sample:]
+
+        # ------------------------------------------------------------
+        # Calculate short-time RMS energy
+        # ------------------------------------------------------------
+        hop = int(0.01 * sr)       # 10 ms
+        window = int(0.05 * sr)    # 50 ms RMS window
+
+        if hop < 1:
+            hop = 1
+
+        if window < 1:
+            window = 1
+
         energy = []
-        for i in range(0, len(audio)-hop, hop):
-            block = audio[i:i+hop]
-            rms = np.sqrt(np.mean(block**2))
+
+        for i in range(0, len(audio) - window, hop):
+            block = audio[i:i + window]
+
+            rms = np.sqrt(np.mean(block ** 2))
             energy.append(rms)
+
         energy = np.array(energy)
+
+        if len(energy) < 3:
+            self.lbl_tempo.setText("Tempo: Could not detect")
+            return
+
+        # ------------------------------------------------------------
+        # Normalize
+        # ------------------------------------------------------------
         energy = energy / (np.max(energy) + 1e-12)
-        threshold = 0.3
+
+        # ------------------------------------------------------------
+        # Smooth the energy envelope
+        # ------------------------------------------------------------
+        smooth_size = 5
+
+        kernel = np.ones(smooth_size) / smooth_size
+
+        energy_smooth = np.convolve(
+            energy,
+            kernel,
+            mode="same"
+        )
+
+        # ------------------------------------------------------------
+        # Detect peaks
+        # ------------------------------------------------------------
+        threshold = 0.35
+
         peaks = []
-        for i in range(1, len(energy)-1):
-            if energy[i] > threshold and energy[i] > energy[i-1] and energy[i] > energy[i+1]:
+
+        for i in range(1, len(energy_smooth) - 1):
+
+            if (
+                energy_smooth[i] > threshold
+                and energy_smooth[i] > energy_smooth[i - 1]
+                and energy_smooth[i] > energy_smooth[i + 1]
+            ):
                 peaks.append(i)
+
+        # ------------------------------------------------------------
+        # Remove peaks that are too close together
+        #
+        # Minimum distance = 0.30 seconds
+        # ------------------------------------------------------------
+        min_distance = int(0.30 / 0.01)
+
+        filtered_peaks = []
+
+        for p in peaks:
+
+            if not filtered_peaks:
+                filtered_peaks.append(p)
+
+            elif p - filtered_peaks[-1] >= min_distance:
+                filtered_peaks.append(p)
+
+            elif energy_smooth[p] > energy_smooth[filtered_peaks[-1]]:
+                filtered_peaks[-1] = p
+
+        peaks = filtered_peaks
+
         if len(peaks) < 2:
             self.lbl_tempo.setText("Tempo: Could not detect")
             return
+
+        # ------------------------------------------------------------
+        # Calculate intervals
+        # ------------------------------------------------------------
         intervals = np.diff(peaks)
+
         median_interval = np.median(intervals)
-        if median_interval == 0:
+
+        if median_interval <= 0:
             self.lbl_tempo.setText("Tempo: --")
             return
-        interval_sec = median_interval * 0.01
-        bpm = 60 / interval_sec
-        self.lbl_tempo.setText(f"Tempo: {bpm:.1f} BPM")
-        beat_times = [p * 0.01 for p in peaks]
-        self.beat_times = beat_times
-        time_axis = np.arange(len(audio)) / sr
-        self.canvas.plot_signal(time_axis, audio, filename=self.current_filename, beat_times=beat_times)
-        self.canvas.update_viewport(0, self.combo_zoom.currentText())
-        QMessageBox.information(self, "Tempo", f"Detected {len(peaks)} beats, BPM = {bpm:.1f}")
 
+        interval_sec = median_interval * 0.01
+
+        bpm = 60.0 / interval_sec
+
+        # ------------------------------------------------------------
+        # Normalize common octave errors
+        # ------------------------------------------------------------
+        while bpm < 60:
+            bpm *= 2
+
+        while bpm > 180:
+            bpm /= 2
+
+        self.lbl_tempo.setText(
+            f"Tempo: {bpm:.1f} BPM"
+        )
+
+        # ------------------------------------------------------------
+        # Draw detected beats on waveform
+        # ------------------------------------------------------------
+
+        # Peaks are measured relative to the audio after the
+        # first 1-second noise section was removed.
+        beat_times = [
+            1.0 + (p * 0.01)
+            for p in peaks
+        ]
+
+        # Convert beat positions to the time scale of the
+        # speed-adjusted audio.
+        if self.speed_factor != 1.0:
+            beat_times = [
+                t / self.speed_factor
+                for t in beat_times
+            ]
+
+        self.beat_times = beat_times
+
+        # IMPORTANT:
+        # Do NOT directly call canvas.plot_signal() here.
+        # _update_waveform() uses the exact same display_audio
+        # that is being played.
+        self._update_waveform(
+            beat_times=self.beat_times
+        )
+
+        QMessageBox.information(
+            self,
+            "Tempo",
+            f"Detected {len(peaks)} beats, BPM = {bpm:.1f}"
+        )
     def apply_resample(self):
         if self.current_audio is None:
             QMessageBox.warning(self, "No Audio", "Load audio first.")
