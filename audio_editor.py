@@ -12,15 +12,18 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QPushButton, QFileDialog, QMessageBox,
     QSlider, QLabel, QComboBox, QDoubleSpinBox, QGroupBox,
     QCheckBox, QGridLayout, QTabWidget, QSizePolicy, QFrame,
-    QDialog
+    QDialog, QLineEdit
 )
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput,QMediaDevices
 from scipy.signal import resample
 from scipy.signal import fftconvolve
-
 from jukebox_gui import JukeboxWindow
-
+from encryption import (
+    embed  as wm_embed,
+    reveal as wm_reveal,
+    max_capacity as wm_max_capacity,
+)
 DARK_STYLE = """
 QMainWindow { background-color: #0d0e12; }
 QWidget { background-color: #0d0e12; color: #e0e0e0; font-family: 'Helvetica', Arial, sans-serif; font-size: 12px; }
@@ -156,8 +159,8 @@ def _spectral_gate(audio, sr,
     valid = win_sum > 1e-10
     out[valid] /= win_sum[valid]
     out = out[:n]
-
     return np.clip(out, -1.0, 1.0)
+
 def format_time(seconds):
     if seconds is None or seconds < 0: return "00:00"
     mins = int(seconds // 60); secs = int(seconds % 60)
@@ -858,7 +861,57 @@ class AudioWorkstation(QMainWindow):
 
         jukebox_layout.addWidget(jukebox_group, 1)
         self.tab_widget.addTab(jukebox_tab, "Jukebox")
+                # ========== Watermark Tab ==========
+        wm_tab = QWidget()
+        wm_layout = QVBoxLayout(wm_tab)
+        wm_layout.setContentsMargins(8, 8, 8, 8)
+        wm_layout.setSpacing(8)
 
+        wm_group = QGroupBox("Watermark Message")
+        wm_grid = QGridLayout(wm_group)
+        wm_grid.setVerticalSpacing(8)
+        wm_grid.setHorizontalSpacing(10)
+
+        wm_grid.addWidget(QLabel("Message:"), 0, 0)
+        self.wm_txt_message = QLineEdit()
+        self.wm_txt_message.setPlaceholderText("Type the message to hide...")
+        wm_grid.addWidget(self.wm_txt_message, 0, 1, 1, 3)
+
+        wm_grid.addWidget(QLabel("Password:"), 1, 0)
+        self.wm_txt_password = QLineEdit()
+        self.wm_txt_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.wm_txt_password.setPlaceholderText("Required to embed and reveal")
+        wm_grid.addWidget(self.wm_txt_password, 1, 1, 1, 3)
+
+        self.btn_wm_sync   = QPushButton("Sync From Editor")
+        self.btn_wm_embed  = QPushButton("Embed")
+        self.btn_wm_reveal = QPushButton("Reveal")
+        self.btn_wm_save   = QPushButton("Save Copy")
+        self.btn_wm_embed.setEnabled(False)
+        self.btn_wm_reveal.setEnabled(False)
+        self.btn_wm_save.setEnabled(False)
+
+        wm_grid.addWidget(self.btn_wm_sync,   2, 0)
+        wm_grid.addWidget(self.btn_wm_embed,  2, 1)
+        wm_grid.addWidget(self.btn_wm_reveal, 2, 2)
+        wm_grid.addWidget(self.btn_wm_save,   2, 3)
+
+        self.wm_lbl_status = QLabel("Ready.")
+        self.wm_lbl_status.setWordWrap(True)
+        self.wm_lbl_status.setMinimumHeight(40)
+        self.wm_lbl_status.setStyleSheet(
+            "color: #00ff88; font-size: 12px; padding: 6px;"
+            "background-color: #14161f; border: 1px solid #2a3040;"
+            "border-radius: 4px;"
+        )
+        wm_grid.addWidget(self.wm_lbl_status, 3, 0, 1, 4)
+
+        for c in range(4):
+            wm_grid.setColumnStretch(c, 1)
+        fill_group(wm_group)
+
+        wm_layout.addWidget(wm_group, 1)
+        self.tab_widget.addTab(wm_tab, "Watermark")
         main_layout.addSpacing(14)
         main_layout.addWidget(self.tab_widget, stretch=4)
 
@@ -903,6 +956,11 @@ class AudioWorkstation(QMainWindow):
 
         self.btn_jukebox_current.clicked.connect(self.open_jukebox_with_current)
         self.btn_jukebox_open.clicked.connect(self.open_jukebox)
+        self.btn_wm_sync.clicked.connect(self.wm_sync_from_editor)
+        self.btn_wm_embed.clicked.connect(self.wm_embed_action)
+        self.btn_wm_reveal.clicked.connect(self.wm_reveal_action)
+        self.btn_wm_save.clicked.connect(self.wm_save_action)
+        self._wm_refresh()
 
     # ------------------------------------------------------------------
     # EQ label + Undo counter updaters
@@ -1085,6 +1143,7 @@ class AudioWorkstation(QMainWindow):
         self.current_audio = audio
         self.current_filename = filename
         self._update_all()
+        self._wm_refresh()
         self._update_undo_label()
 
     def reset_audio(self):
@@ -1097,6 +1156,7 @@ class AudioWorkstation(QMainWindow):
         self.undo_stack.clear()
         self._update_undo_label()
         self._update_all()
+        self._wm_refresh()
         self._reset_ui_controls()
         QMessageBox.information(self, "Reset", "Audio and controls reset.")
 
@@ -1127,6 +1187,7 @@ class AudioWorkstation(QMainWindow):
             self.btn_preview_remix.setEnabled(False)
             self.previewing_remix = False
             self._reset_ui_controls()
+            self._wm_refresh()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not read audio:\n{str(e)}")
 
@@ -2104,7 +2165,99 @@ class AudioWorkstation(QMainWindow):
             QMessageBox.warning(self, "No Audio", "Load audio first.")
             return
         self.open_jukebox().load_track(*self._editor_track())
+        # ------------------------------------------------------------------
+    # Watermark
+    # ------------------------------------------------------------------
+    def _wm_refresh(self):
+        if self.current_audio is None:
+            self.wm_lbl_status.setText("Load audio into the editor first.")
+            self.btn_wm_embed.setEnabled(False)
+            self.btn_wm_reveal.setEnabled(False)
+            self.btn_wm_save.setEnabled(False)
+            return
 
+        n = len(self.current_audio)
+        cap = wm_max_capacity(n)
+        self.wm_lbl_status.setText(
+            f"Ready. Max message length: {cap} bytes."
+        )
+        self.btn_wm_embed.setEnabled(True)
+        self.btn_wm_reveal.setEnabled(True)
+        self.btn_wm_save.setEnabled(True)
+
+    def _wm_set_status(self, text, ok=True):
+        color = "#00ff88" if ok else "#ff5566"
+        self.wm_lbl_status.setStyleSheet(
+            f"color: {color}; font-size: 12px; padding: 6px;"
+            f"background-color: #14161f; border: 1px solid #2a3040;"
+            f"border-radius: 4px;"
+        )
+        self.wm_lbl_status.setText(text)
+
+    def wm_sync_from_editor(self):
+        self._wm_refresh()
+
+    def wm_embed_action(self):
+        if self.current_audio is None:
+            return
+        msg = self.wm_txt_message.text().strip()
+        pw  = self.wm_txt_password.text()
+        if not msg:
+            QMessageBox.warning(self, "Missing Message", "Type a message first.")
+            return
+        if not pw:
+            QMessageBox.warning(self, "Missing Password", "Enter a password.")
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                wm = wm_embed(self.current_audio, self.sr, msg, pw)
+            finally:
+                QApplication.restoreOverrideCursor()
+
+            self.push_undo()
+            self.current_audio = wm
+            self.current_filename += " [watermarked]"
+            self._update_all()
+            self._wm_refresh()
+            self._wm_set_status(
+                f"✓ Embedded {len(msg.encode('utf-8'))} bytes.", ok=True
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Embed Error", str(e))
+
+    def wm_reveal_action(self):
+        if self.current_audio is None:
+            return
+        pw = self.wm_txt_password.text()
+        if not pw:
+            QMessageBox.warning(self, "Missing Password",
+                                "Enter the password used to embed.")
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                message = wm_reveal(self.current_audio, self.sr, pw)
+            finally:
+                QApplication.restoreOverrideCursor()
+            self._wm_set_status(f"✓ Watermark found:\n\n    {message!r}", ok=True)
+        except ValueError as e:
+            self._wm_set_status(f"✗ {e}", ok=False)
+
+    def wm_save_action(self):
+        if self.current_audio is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Watermarked Audio", "watermarked.wav",
+            "WAV Files (*.wav);;FLAC Files (*.flac)",
+        )
+        if not path:
+            return
+        try:
+            sf.write(path, self.current_audio, self.sr)
+            self._wm_set_status(f"✓ Saved to:\n{path}", ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
     def closeEvent(self, event):
         if self.jukebox_window is not None:
             self.jukebox_window.close()
