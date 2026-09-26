@@ -27,11 +27,11 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-AMPLITUDE        = 0.005
-SILENT_FLOOR     = 0.05
-BAND_LOW_HZ      = 2500.0
-BAND_HIGH_HZ     = 6500.0
-ENV_SMOOTH_MS    = 20.0
+AMPLITUDE    = 0.015
+SILENT_FLOOR = 0.15         # was 0.35
+BAND_LOW_HZ  = 700.0         # was 2500
+BAND_HIGH_HZ = 2800.0        # was 6500
+ENV_SMOOTH_MS = 25.0
 
 MAX_MSG_BYTES    = 5000
 MAGIC            = b"\xA5\x5A"

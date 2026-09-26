@@ -627,7 +627,7 @@ class AudioWorkstation(QMainWindow):
 
         eq_layout.addWidget(QLabel("Low"), 0, 0)
         self.eq_low = QSlider(Qt.Orientation.Horizontal)
-        self.eq_low.setRange(-12, 12); self.eq_low.setValue(0)
+        self.eq_low.setRange(-24, 24); self.eq_low.setValue(0)
         eq_layout.addWidget(self.eq_low, 0, 1)
         self.lbl_eq_low = QLabel("0 dB")
         self.lbl_eq_low.setObjectName("eqValue")
@@ -638,7 +638,7 @@ class AudioWorkstation(QMainWindow):
 
         eq_layout.addWidget(QLabel("Mid"), 1, 0)
         self.eq_mid = QSlider(Qt.Orientation.Horizontal)
-        self.eq_mid.setRange(-12, 12); self.eq_mid.setValue(0)
+        self.eq_mid.setRange(-24, 24); self.eq_mid.setValue(0)
         eq_layout.addWidget(self.eq_mid, 1, 1)
         self.lbl_eq_mid = QLabel("0 dB")
         self.lbl_eq_mid.setObjectName("eqValue")
@@ -649,7 +649,7 @@ class AudioWorkstation(QMainWindow):
 
         eq_layout.addWidget(QLabel("High"), 2, 0)
         self.eq_high = QSlider(Qt.Orientation.Horizontal)
-        self.eq_high.setRange(-12, 12); self.eq_high.setValue(0)
+        self.eq_high.setRange(-24, 24); self.eq_high.setValue(0)
         eq_layout.addWidget(self.eq_high, 2, 1)
         self.lbl_eq_high = QLabel("0 dB")
         self.lbl_eq_high.setObjectName("eqValue")
@@ -1548,11 +1548,11 @@ class AudioWorkstation(QMainWindow):
             kernel[tail_start:] += tail
 
         kernel_energy = np.sqrt(np.sum(kernel ** 2))
-        if kernel_energy > 0:
-            kernel = kernel / kernel_energy * 0.5
-
+        peak = np.max(np.abs(kernel))
+        if peak > 0:
+            kernel = kernel / peak * 0.8
         wet = fftconvolve(self.current_audio, kernel, mode='same')
-        mixed = 0.6 * self.current_audio + 0.4 * wet
+        mixed = 0.7 * self.current_audio + 0.3 * wet
         np.clip(mixed, -1.0, 1.0, out=mixed)
 
         self.current_audio = mixed
