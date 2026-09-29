@@ -1,0 +1,4 @@
+node_modules/
+telemetry.jsonl
+*.bak
+*.bak[0-9]

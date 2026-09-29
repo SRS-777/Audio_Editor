@@ -1,0 +1,1324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    />
+
+    <title>Joy-Con Saber Tracker</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            overflow: hidden;
+            background: #101218;
+            color: white;
+            font-family: Arial, sans-serif;
+        }
+
+        #controls {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        button {
+            padding: 10px 18px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        #status {
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 6px;
+        }
+
+        #prompt {
+            position: fixed;
+            top: 90px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+
+            max-width: 620px;
+            padding: 18px 26px;
+
+            background: rgba(0, 0, 0, 0.75);
+            border: 1px solid #3399ff;
+            border-radius: 10px;
+
+            font-size: 19px;
+            line-height: 1.5;
+            text-align: center;
+        }
+
+        #prompt[hidden] {
+            display: none;
+        }
+
+        #prompt-feedback {
+            margin-top: 10px;
+
+            font-family: Consolas, monospace;
+            font-size: 14px;
+            color: #9fb3c8;
+        }
+
+        #debug {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            z-index: 10;
+
+            margin: 0;
+            padding: 10px;
+
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 6px;
+
+            font-family: Consolas, monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            color: #9fb3c8;
+
+            white-space: pre;
+            pointer-events: none;
+        }
+
+        /*
+            The scene carries the perspective; the stage inside
+            it keeps its children in real 3D rather than
+            flattening them. Without preserve-3d every blade
+            would collapse back into the page.
+        */
+        #play-area {
+            position: relative;
+            z-index: 2;
+            width: 100vw;
+            height: 100vh;
+
+            perspective: 1100px;
+            perspective-origin: 50% 45%;
+            overflow: visible;  /* Allow sabers to go outside viewport */
+        }
+
+        #stage {
+            position: absolute;
+            inset: 0;
+            transform-style: preserve-3d;
+            overflow: visible;  /* Allow sabers to go outside viewport */
+        }
+
+        /*
+            Position comes entirely from the transform set in
+            main.js, so left and top stay pinned at zero. That
+            keeps every update off the layout path.
+
+            The blade hinges at its own bottom edge, which is
+            pinned to the hand, so rotating it swings the blade
+            about the hand instead of moving it. Its height is
+            the saber's real length and never changes — only the
+            perspective makes it look shorter or longer.
+        */
+        .saber {
+            position: absolute;
+            left: 0;
+            top: 0;
+
+            width: 30px;
+            height: var(--blade-length, 150px);
+            border-radius: 15px;
+
+            transform-origin: 50% 100%;
+            transform-style: preserve-3d;
+            backface-visibility: visible;
+            will-change: transform;
+
+            /*
+                A lightsaber is a white-hot core with the colour
+                only in the bloom around it, not a coloured bar.
+            */
+            background: linear-gradient(
+                90deg,
+                var(--ink) 0%,
+                #ffffff 34%,
+                #ffffff 66%,
+                var(--ink) 100%
+            );
+
+            /*
+                --glow is written each frame from how fast the
+                saber is moving, so a hard swing flares.
+            */
+            box-shadow:
+                0 0 calc(10px + var(--glow, 0) * 14px)
+                    var(--ink),
+                0 0 calc(26px + var(--glow, 0) * 40px)
+                    var(--ink);
+
+            transition: filter 90ms ease-out;
+        }
+
+        /*
+            The second panel of each blade, crossed at a right
+            angle so the saber never vanishes edge on.
+        */
+        .saber.cross {
+            opacity: 0.75;
+        }
+
+        /*
+            Trail segments are dimmer copies of the blade left
+            behind as it swings. They must not catch the slash
+            flash or they would strobe, so no transition here.
+        */
+        .saber.trail {
+            transition: none;
+            box-shadow: none;
+            border-radius: 3px;
+
+            /* Flat colour, so the smear reads as a trail. */
+            background: var(--ink);
+        }
+
+        .saber.slashing {
+            filter: brightness(1.9);
+        }
+
+        /*
+            The glowing tip is its own element rather than part
+            of the blade, because the blade is scaled as it
+            ignites and that would squash a tip drawn inside it.
+        */
+        .tip {
+            position: absolute;
+            left: 0;
+            top: 0;
+
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+
+            background: #ffffff;
+
+            box-shadow:
+                0 0 calc(10px + var(--glow, 0) * 16px) var(--ink),
+                0 0 calc(24px + var(--glow, 0) * 34px) var(--ink);
+
+            will-change: transform;
+        }
+
+        /*
+            The grip, lying along the blade at the hand. It does
+            not extend with the blade, so it stays put while the
+            saber ignites.
+        */
+        .hilt {
+            position: absolute;
+            left: 0;
+            top: 0;
+
+            width: 38px;
+            height: 92px;
+            border-radius: 4px;
+
+            transform-origin: 50% 100%;
+            will-change: transform;
+
+            background: linear-gradient(
+                90deg,
+                #23262c 0%,
+                #98a1ab 36%,
+                #e8edf2 52%,
+                #6f777d 70%,
+                #1b1e23 100%
+            );
+
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.9);
+        }
+
+        #left-saber,
+        #left-cross,
+        #left-tip {
+            --ink: #ff3355;
+        }
+
+        #right-saber,
+        #right-cross,
+        #right-tip {
+            --ink: #3399ff;
+        }
+
+        .left-ink {
+            --ink: #ff3355;
+        }
+
+        .right-ink {
+            --ink: #3399ff;
+        }
+
+        /*
+            Blocks are real cubes in the same space as the
+            sabers, so they grow as they approach and can be
+            passed on either side.
+        */
+        .block {
+            position: absolute;
+            left: 0;
+            top: 0;
+
+            width: 78px;
+            height: 78px;
+
+            transform-style: preserve-3d;
+            will-change: transform;
+        }
+
+        .block-face {
+            position: absolute;
+            inset: 0;
+
+            border: 2px solid rgba(255, 255, 255, 0.25);
+            background: #2a2f3a;
+        }
+
+        .left-block .block-face {
+            background: linear-gradient(
+                150deg, #d92546, #8c1229);
+            box-shadow: inset 0 0 22px rgba(255, 90, 120, 0.5);
+        }
+
+        .right-block .block-face {
+            background: linear-gradient(
+                150deg, #2277dd, #12406f);
+            box-shadow: inset 0 0 22px rgba(110, 180, 255, 0.5);
+        }
+
+        /* The arrow saying which way it has to be cut. */
+        .block-arrow {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+
+            width: 38px;
+            height: 34px;
+            margin: -17px 0 0 -19px;
+
+            background: rgba(255, 255, 255, 0.92);
+            clip-path: polygon(50% 0, 100% 100%, 0 100%);
+        }
+
+        /*
+            A dot block's marking. It has to read as "no
+            direction" at a glance and from a distance, so it is
+            a plain circle rather than a smaller or fainter
+            arrow, which would just look like an arrow you
+            cannot make out.
+        */
+        .block-pip {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+
+            width: 34px;
+            height: 34px;
+            margin: -17px 0 0 -17px;
+
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.92);
+        }
+
+        /*
+            The heavy shapes are told apart by more than their
+            outline: a long block is lit brighter along its
+            edges, because head on it is the same square as a
+            cube and the depth is the whole difference.
+        */
+        .block-long .block-face {
+            border-color: rgba(255, 255, 255, 0.5);
+        }
+
+        .block-small .block-face {
+            border-width: 3px;
+        }
+
+        .block-dot .block-face {
+            border-radius: 6px;
+        }
+
+        /*
+            HOW CLOSE TO THE BEAT.
+
+            Printed at the block that was just cut rather than
+            in a corner, because at this speed you have no
+            attention to spare for looking away, and a timing
+            readout you do not read is no readout.
+        */
+        #judgment {
+            position: absolute;
+            z-index: 40;
+
+            transform: translate(-50%, -140px);
+
+            font: 700 26px/1 "Segoe UI", system-ui, sans-serif;
+            letter-spacing: 0.08em;
+
+            opacity: 0;
+            pointer-events: none;
+            text-shadow: 0 2px 14px rgba(0, 0, 0, 0.85);
+        }
+
+        #judgment.judge-perfect { color: #ffe066; }
+        #judgment.judge-great   { color: #8ef0a0; }
+        #judgment.judge-good    { color: #9ccdf5; }
+        #judgment.judge-ok      { color: #b9b9c4; }
+
+        #judgment.pop {
+            animation: judgment 520ms ease-out forwards;
+        }
+
+        @keyframes judgment {
+            0% {
+                opacity: 0;
+                transform: translate(-50%, -110px) scale(0.8);
+            }
+            18% {
+                opacity: 1;
+                transform: translate(-50%, -140px) scale(1.08);
+            }
+            100% {
+                opacity: 0;
+                transform: translate(-50%, -190px) scale(1);
+            }
+        }
+
+        /*
+            A cut block spins off and fades rather than simply
+            disappearing, with a slashing effect.
+        */
+        .block.cut {
+            animation: cut 450ms ease-out forwards;
+        }
+
+        @keyframes cut {
+            to {
+                opacity: 0;
+                filter: brightness(2.4);
+                transform: translate3d(var(--cut-x, 0), var(--cut-y, 0), var(--cut-z, 0)) 
+                           translate(-50%, -50%) 
+                           rotate3d(1, 1, 0, 180deg) 
+                           scale(0.6);
+            }
+        }
+
+        /*
+            A block that got past you. It goes hard red at the
+            moment it stops being cuttable, flares, and drops
+            away — the opposite of a cut, which flies apart
+            bright. Dimming it, as this used to, read as the
+            block politely leaving rather than as something
+            you let through.
+        */
+        .block.missed .block-face {
+            background: #c0121f !important;
+            border-color: #ff5a68 !important;
+            box-shadow:
+                inset 0 0 0 2px rgba(255, 120, 130, 0.9),
+                0 0 26px rgba(220, 30, 50, 0.75) !important;
+        }
+
+        .block.missed .block-arrow {
+            opacity: 0.25;
+        }
+
+        .block.missed {
+            animation: missed 300ms ease-out forwards;
+        }
+
+        @keyframes missed {
+            0%   { filter: brightness(2.1) saturate(1.5); }
+            35%  { filter: brightness(1.3) saturate(1.4); }
+            100% {
+                opacity: 0;
+                filter: brightness(0.5) saturate(1.4);
+            }
+        }
+
+        /*
+            Damage vignette. A block reaching you is the only
+            thing in the game that happens TO you, so it is
+            the one event that marks the whole screen rather
+            than a place in it.
+        */
+        #damage-flash {
+            position: fixed;
+            inset: 0;
+            z-index: 60;
+            pointer-events: none;
+            opacity: 0;
+            background:
+                radial-gradient(
+                    ellipse at center,
+                    rgba(255, 0, 30, 0) 42%,
+                    rgba(255, 0, 30, 0.30) 78%,
+                    rgba(190, 0, 25, 0.62) 100%
+                );
+        }
+
+        #damage-flash.hit {
+            animation: damage 420ms ease-out;
+        }
+
+        @keyframes damage {
+            0%   { opacity: 0; }
+            12%  { opacity: 1; }
+            100% { opacity: 0; }
+        }
+
+        /* Slash trail effect */
+        .slash-effect {
+            position: absolute;
+            pointer-events: none;
+            z-index: 999;
+            opacity: 0;
+        }
+
+        .slash-line {
+            position: absolute;
+            background: linear-gradient(
+                90deg,
+                transparent,
+                rgba(255, 255, 255, 0.9) 30%,
+                rgba(255, 255, 255, 0.9) 70%,
+                transparent
+            );
+            box-shadow: 
+                0 0 10px rgba(255, 255, 255, 0.8),
+                0 0 20px var(--slash-color, rgba(255, 100, 100, 0.6)),
+                0 0 30px var(--slash-color, rgba(255, 100, 100, 0.4));
+            border-radius: 2px;
+            transform-origin: center;
+            animation: slash 400ms ease-out forwards;
+        }
+
+        @keyframes slash {
+            0% {
+                opacity: 1;
+                width: 0;
+                filter: brightness(2);
+            }
+            50% {
+                opacity: 1;
+                width: var(--slash-length, 200px);
+            }
+            100% {
+                opacity: 0;
+                width: var(--slash-length, 200px);
+                filter: brightness(0.5);
+            }
+        }
+
+        #score {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 10;
+
+            padding: 10px 14px;
+
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 6px;
+
+            font-family: Consolas, monospace;
+            font-size: 15px;
+            color: #d7e3ee;
+
+            pointer-events: none;
+        }
+
+        #music-info {
+            position: fixed;
+            top: 60px;
+            right: 20px;
+            z-index: 10;
+
+            padding: 8px 12px;
+
+            background: rgba(50, 150, 255, 0.3);
+            border: 1px solid rgba(80, 180, 255, 0.5);
+            border-radius: 6px;
+
+            font-family: Consolas, monospace;
+            font-size: 13px;
+            color: #b8d7f5;
+
+            pointer-events: none;
+        }
+
+        #music-info[hidden] {
+            display: none;
+        }
+
+        /* Test mode cursor */
+        body.test-mode {
+            cursor: none;
+        }
+
+        #test-cursor {
+            position: fixed;
+            width: 230px;
+            height: 230px;
+            border: 3px solid rgba(255, 152, 0, 0.8);
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 9999;
+            display: none;
+            transform: translate(-50%, -50%);
+            background: radial-gradient(
+                circle,
+                rgba(255, 152, 0, 0.1) 0%,
+                transparent 70%
+            );
+        }
+
+        body.test-mode #test-cursor {
+            display: block;
+        }
+
+        #test-cursor.fast {
+            border-color: rgba(76, 175, 80, 1);
+            background: radial-gradient(
+                circle,
+                rgba(76, 175, 80, 0.2) 0%,
+                transparent 70%
+            );
+            box-shadow: 0 0 20px rgba(76, 175, 80, 0.6);
+        }
+
+        #slash {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 10;
+
+            padding: 10px 14px;
+
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 6px;
+
+            font-family: Consolas, monospace;
+            font-size: 15px;
+            color: #d7e3ee;
+
+            pointer-events: none;
+        }
+
+        /*
+            Control-correction cheatsheet. Sits out of the play
+            area, low contrast, so it is there when a saber is
+            going the wrong way and ignorable when it is not.
+        */
+        #tuning-help {
+            position: fixed;
+            left: 16px;
+            top: 74px;
+            z-index: 40;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.55);
+            color: rgba(255, 255, 255, 0.62);
+            font: 11px/1.5 ui-monospace, Consolas, monospace;
+            pointer-events: none;
+        }
+
+        /*
+            Guides for a flat screen. The playfield is a 3D
+            tunnel but the player is looking at a picture of
+            one, so where a block sits in depth has to be
+            drawn rather than inferred.
+        */
+        /*
+            THE SCENE.
+
+            An anime action look leans on a few specific
+            things: a deep saturated ground, hard rim light,
+            radial speed lines that appear only at the moment
+            of impact, and bloom that blows out rather than
+            fading politely. The playfield below is a tunnel
+            receding to a vanishing point, animated toward the
+            camera so the world reads as rushing past even
+            when nothing is being cut.
+        */
+        #sky {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            background:
+                radial-gradient(
+                    ellipse 70% 55% at 50% 46%,
+                    #3a1d6e 0%,
+                    #1b1040 38%,
+                    #0a0a1e 70%,
+                    #05060f 100%
+                );
+        }
+
+        /*
+            A slow chromatic wash, so the background is never
+            quite static.
+        */
+        #sky::after {
+            content: "";
+            position: absolute;
+            inset: -20%;
+            background:
+                radial-gradient(
+                    circle at 28% 32%,
+                    rgba(255, 60, 160, 0.20),
+                    transparent 46%
+                ),
+                radial-gradient(
+                    circle at 74% 62%,
+                    rgba(0, 200, 255, 0.20),
+                    transparent 48%
+                );
+            animation: drift-sky 19s ease-in-out infinite alternate;
+        }
+
+        @keyframes drift-sky {
+            from { transform: translate3d(-3%, -2%, 0) scale(1); }
+            to   { transform: translate3d(3%, 2%, 0) scale(1.12); }
+        }
+
+        /*
+            The floor grid. Two layers scrolling at different
+            speeds give the tunnel parallax without any
+            per-frame work in script.
+        */
+        #floor {
+            position: fixed;
+            left: -50%;
+            width: 200%;
+            top: 62%;
+            height: 38%;
+            z-index: 1;
+            pointer-events: none;
+            opacity: 0.55;
+            transform: perspective(300px) rotateX(80deg);
+            transform-origin: 50% 0%;
+            background-image:
+                repeating-linear-gradient(
+                    to right,
+                    rgba(120, 190, 255, 0.40) 0 2px,
+                    transparent 2px 84px
+                ),
+                repeating-linear-gradient(
+                    to bottom,
+                    rgba(255, 70, 190, 0.34) 0 2px,
+                    transparent 2px 84px
+                );
+            animation: rush 1.15s linear infinite;
+            mask-image: linear-gradient(
+                to bottom,
+                transparent 0%,
+                rgba(0, 0, 0, 0.45) 22%,
+                #000 60%
+            );
+        }
+
+        @keyframes rush {
+            from { background-position: 0 0, 0 0; }
+            to   { background-position: 0 0, 0 84px; }
+        }
+
+        /*
+            Matching ceiling, dimmer, so the playfield reads as
+            a corridor rather than a floor with sky above it.
+        */
+        #ceiling {
+            position: fixed;
+            left: -50%;
+            width: 200%;
+            bottom: 68%;
+            height: 32%;
+            z-index: 1;
+            pointer-events: none;
+            opacity: 0.40;
+            transform: perspective(300px) rotateX(-80deg);
+            transform-origin: 50% 100%;
+            background-image:
+                repeating-linear-gradient(
+                    to right,
+                    rgba(120, 190, 255, 0.28) 0 2px,
+                    transparent 2px 120px
+                ),
+                repeating-linear-gradient(
+                    to bottom,
+                    rgba(120, 90, 255, 0.22) 0 2px,
+                    transparent 2px 120px
+                );
+            animation: rush 1.15s linear infinite;
+            mask-image: linear-gradient(
+                to top,
+                transparent 0%,
+                rgba(0, 0, 0, 0.4) 26%,
+                #000 64%
+            );
+        }
+
+        /*
+            Speed lines. Hidden until a cut lands, then drawn
+            once, hard — the single most anime thing available
+            and worthless if it is on all the time.
+        */
+        /*
+            THE CROWD.
+
+            Artwork the player supplies, paraded across the
+            background. Nothing is drawn here: the figures are
+            whatever is in dancers/, and an animated GIF brings
+            its own movement, so all this has to do is walk
+            them on and off.
+
+            They live behind the playfield and well below it in
+            contrast, because anything competing with the
+            blocks for attention is a bug rather than a
+            feature.
+        */
+        #dancers {
+            position: fixed;
+            inset: 0;
+            z-index: 1;
+            pointer-events: none;
+            overflow: hidden;
+        }
+
+        .dancer {
+            position: absolute;
+            top: var(--y);
+            left: 0;
+            opacity: 0;
+            will-change: transform, opacity;
+            animation: parade var(--dur) ease-in-out forwards;
+            filter:
+                drop-shadow(0 0 14px var(--glow,
+                    rgba(255, 90, 210, 0.5)))
+                drop-shadow(0 0 44px var(--glow,
+                    rgba(90, 160, 255, 0.3)));
+        }
+
+        /*
+            Real artwork, when a sprite pack is present.
+        */
+        .dancer.sprite {
+            /*
+                A tight pale rim, then a wider cool glow.
+
+                The playfield is nearly black, so a character
+                dressed in black had nothing to separate it from
+                the scene and read as a floating head and a pair
+                of hands. The tight shadow traces the cutout's
+                own edge and gives every sprite an outline to sit
+                against; the wide one lifts it off the
+                background. The heavy dark shadow that used to be
+                here did the opposite of what was needed.
+            */
+            filter:
+                drop-shadow(0 0 2px rgba(214, 233, 255, 0.95))
+                drop-shadow(0 0 5px rgba(180, 214, 255, 0.55))
+                drop-shadow(0 0 26px rgba(120, 170, 255, 0.35));
+        }
+
+        .dancer.sprite img {
+            display: block;
+
+            /*
+                Kept well under the shortest source height, so
+                every sprite is scaled DOWN to reach it. Drawn
+                larger than its source a sprite is soft, and the
+                cat is only 254px tall — at the old 300px, times
+                a scale that could reach 1.2, it was being blown
+                up half again and filling a third of the screen
+                with a blurry cat.
+            */
+            /*
+                Set per sprite from the manifest. These are not
+                drawn to a common scale — a full figure and a
+                round mascot each look right only at their own
+                size — so the crowd cannot share one number.
+            */
+            height: var(--dh, 150px);
+            width: auto;
+            image-rendering: auto;
+
+            /* Brightening, for artwork too dark for the scene. */
+            filter: var(--lift, none);
+        }
+
+        @keyframes parade {
+            0% {
+                transform: translate3d(var(--enter), 0, 0)
+                    scale(var(--s));
+                opacity: 0;
+            }
+            10% {
+                transform: translate3d(var(--x), 0, 0)
+                    scale(var(--s));
+                opacity: 0.92;
+            }
+            86% {
+                transform: translate3d(var(--x), 0, 0)
+                    scale(var(--s));
+                opacity: 0.92;
+            }
+            100% {
+                transform: translate3d(var(--exit), 0, 0)
+                    scale(var(--s));
+                opacity: 0;
+            }
+        }
+
+        /*
+            Falling petals. Cheap, endless, and the fastest way
+            to make a scene feel hand-drawn rather than
+            rendered.
+        */
+        #petals {
+            position: fixed;
+            inset: 0;
+            z-index: 2;
+            pointer-events: none;
+            overflow: hidden;
+        }
+
+        .petal {
+            position: absolute;
+            top: -6%;
+            left: var(--x);
+            width: var(--pw);
+            height: calc(var(--pw) * 0.72);
+            background: var(--pc);
+            border-radius: 70% 0 70% 0;
+            opacity: 0;
+            animation: fall var(--dur) linear var(--delay) infinite;
+        }
+
+        @keyframes fall {
+            0% {
+                transform: translate3d(0, 0, 0) rotate(0deg);
+                opacity: 0;
+            }
+            8%   { opacity: 0.75; }
+            92%  { opacity: 0.6; }
+            100% {
+                transform:
+                    translate3d(var(--sway), 118vh, 0)
+                    rotate(540deg);
+                opacity: 0;
+            }
+        }
+
+        /*
+            Combo callout. Hard outline, heavy skew, snaps in
+            and drifts out.
+        */
+        #callout {
+            position: fixed;
+            left: 50%;
+            top: 24%;
+            z-index: 58;
+            pointer-events: none;
+            opacity: 0;
+            font: 900 clamp(28px, 5.4vw, 74px)/1
+                "Arial Black", Arial, sans-serif;
+            letter-spacing: 2px;
+            white-space: nowrap;
+            color: #fff;
+            -webkit-text-stroke: 3px #16032c;
+            text-shadow:
+                0 4px 0 #16032c,
+                0 0 26px rgba(255, 120, 220, 0.95),
+                0 0 60px rgba(120, 190, 255, 0.7);
+        }
+
+        #callout.pop {
+            animation: callout 780ms cubic-bezier(.16,1,.3,1);
+        }
+
+        @keyframes callout {
+            0% {
+                opacity: 0;
+                transform:
+                    translate(-50%, 0) scale(0.4)
+                    rotate(-14deg) skewX(-16deg);
+            }
+            16% {
+                opacity: 1;
+                transform:
+                    translate(-50%, 0) scale(1.16)
+                    rotate(-6deg) skewX(-10deg);
+            }
+            34% {
+                transform:
+                    translate(-50%, 0) scale(1)
+                    rotate(-3deg) skewX(-8deg);
+            }
+            100% {
+                opacity: 0;
+                transform:
+                    translate(-50%, -54px) scale(1.04)
+                    rotate(-2deg) skewX(-8deg);
+            }
+        }
+
+        #speed-lines {
+            position: fixed;
+            inset: 0;
+            z-index: 55;
+            pointer-events: none;
+            opacity: 0;
+            background:
+                repeating-conic-gradient(
+                    from 0deg at 50% 46%,
+                    rgba(255, 255, 255, 0.85) 0deg 0.4deg,
+                    transparent 0.4deg 4.2deg
+                );
+            mask-image: radial-gradient(
+                circle at 50% 46%,
+                transparent 30%,
+                rgba(0, 0, 0, 0.55) 58%,
+                #000 100%
+            );
+        }
+
+        #speed-lines.burst {
+            animation: speed-burst 260ms ease-out;
+        }
+
+        @keyframes speed-burst {
+            0%   { opacity: 0; transform: scale(1.4); }
+            16%  {
+                opacity: calc(0.30 + var(--burst, 0.5) * 0.45);
+                transform: scale(1);
+            }
+            100% { opacity: 0; transform: scale(0.88); }
+        }
+
+        #strike-zone {
+            position: absolute;
+            inset: 0;
+            transform-style: preserve-3d;
+            pointer-events: none;
+        }
+
+        .lane-line {
+            position: absolute;
+            left: 0;
+            top: 0;
+            transform-origin: 50% 50%;
+            background: linear-gradient(
+                to bottom,
+                rgba(120, 170, 255, 0) 0%,
+                rgba(120, 170, 255, 0.22) 55%,
+                rgba(120, 170, 255, 0.85) 100%
+            );
+        }
+
+        .lane-centre {
+            background: linear-gradient(
+                to bottom,
+                rgba(255, 255, 255, 0) 0%,
+                rgba(255, 255, 255, 0.24) 55%,
+                rgba(255, 255, 255, 0.70) 100%
+            );
+        }
+
+        /*
+            The plane where blocks are cut.
+        */
+        .strike-frame {
+            position: absolute;
+            left: 0;
+            top: 0;
+            border: 2px solid rgba(120, 220, 160, 0.45);
+            border-radius: 10px;
+            box-shadow:
+                0 0 24px rgba(120, 220, 160, 0.16),
+                inset 0 0 24px rgba(120, 220, 160, 0.07);
+        }
+
+        /*
+            A block lights its edge the moment it enters the
+            window the hit test accepts: swing now.
+        */
+        .block.cuttable .block-face {
+            box-shadow:
+                inset 0 0 0 2px rgba(255, 255, 255, 0.85),
+                0 0 18px rgba(255, 255, 255, 0.28);
+        }
+
+        #miss-breakdown {
+            position: fixed;
+            right: 16px;
+            top: 110px;
+            z-index: 40;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.62);
+            color: rgba(255, 255, 255, 0.72);
+            font: 11px/1.5 ui-monospace, Consolas, monospace;
+            text-align: right;
+            pointer-events: none;
+        }
+
+        #miss-breakdown b {
+            color: #ff8a80;
+            font-weight: 600;
+            margin-bottom: 3px;
+        }
+
+        #miss-breakdown i {
+            color: #fff;
+            font-style: normal;
+            font-weight: 700;
+        }
+
+        #tuning-help b {
+            color: rgba(255, 255, 255, 0.85);
+            font-weight: 600;
+            margin-bottom: 3px;
+        }
+
+        /*
+            DROPPING A SONG IN.
+
+            Covers the playfield only while a file is actually
+            over the window, because a permanent invitation to
+            drop something is clutter once you have.
+        */
+        #song-drop {
+            position: fixed;
+            inset: 0;
+            z-index: 90;
+
+            display: none;
+            align-items: center;
+            justify-content: center;
+
+            background: rgba(6, 8, 16, 0.82);
+            backdrop-filter: blur(3px);
+        }
+
+        #song-drop.over {
+            display: flex;
+        }
+
+        #song-drop > div {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding: 34px 48px;
+
+            border: 2px dashed rgba(140, 200, 255, 0.55);
+            border-radius: 16px;
+
+            text-align: center;
+        }
+
+        #song-drop strong {
+            font: 700 27px/1.2 "Segoe UI", system-ui, sans-serif;
+            color: #cfe6ff;
+        }
+
+        #song-drop span {
+            font: 400 14px/1.4 "Segoe UI", system-ui, sans-serif;
+            color: rgba(210, 225, 245, 0.72);
+        }
+
+        /*
+            Analysing a track takes about a second, and a second
+            of a page doing nothing visible reads as a page that
+            has broken. This says which stage it is at.
+        */
+        #song-status {
+            position: fixed;
+            left: 50%;
+            top: 74px;
+            z-index: 95;
+
+            transform: translateX(-50%);
+            padding: 11px 22px;
+
+            border: 1px solid rgba(140, 200, 255, 0.35);
+            border-radius: 10px;
+            background: rgba(10, 14, 26, 0.93);
+
+            font: 600 15px/1.3 "Segoe UI", system-ui, sans-serif;
+            color: #d8e8ff;
+            white-space: nowrap;
+        }
+
+        #song-status.bad {
+            border-color: rgba(255, 120, 130, 0.55);
+            color: #ffc9ce;
+        }
+
+        #song-status.good {
+            border-color: rgba(130, 235, 165, 0.5);
+            color: #ccf6d9;
+        }
+
+        /*
+            CONTROLLER DIAGNOSTICS.
+
+            "It is connected but nothing happens" is the hardest
+            fault to work on, because every stage of it looks the
+            same from outside: a controller that was refused, one
+            that sends no packets, one that sends packets with no
+            motion in them, and one whose buttons are not being
+            read all present as a saber that does not move. This
+            separates them.
+        */
+        #devices {
+            position: fixed;
+            right: 12px;
+            bottom: 12px;
+            z-index: 96;
+
+            max-width: 430px;
+            padding: 12px 14px;
+
+            border: 1px solid rgba(140, 200, 255, 0.3);
+            border-radius: 10px;
+            background: rgba(8, 11, 20, 0.94);
+
+            font: 400 12px/1.6 "Cascadia Mono", Consolas, monospace;
+            color: #cfe0f5;
+            white-space: pre;
+        }
+
+        #devices b {
+            color: #fff;
+            font-weight: 700;
+        }
+
+        #devices .good { color: #8ef0a0; }
+        #devices .bad  { color: #ff8b95; }
+        #devices .warn { color: #ffd479; }
+        #devices .dim  { color: rgba(200, 215, 235, 0.45); }
+
+        #tuning-help kbd {
+            display: inline-block;
+            min-width: 14px;
+            padding: 1px 4px;
+            border: 1px solid rgba(255, 255, 255, 0.28);
+            border-radius: 3px;
+            background: rgba(255, 255, 255, 0.08);
+            color: #fff;
+            text-align: center;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="controls">
+        <button id="connect-button">Connect Joy-Con</button>
+        <button id="calibrate-button">Calibrate (C)</button>
+        <button id="recenter-button">Recenter (Space)</button>
+        <button id="swap-button">Swap hands (S)</button>
+        <button id="blocks-button">Start blocks (B)</button>
+        <button id="song-button">Load song (L)</button>
+        <input id="song-input" type="file" accept="audio/*" hidden>
+        <button id="test-mode-button" style="background: #ff9800; color: #000;">Test Mode (T)</button>
+        <span id="status">No Joy-Cons connected</span>
+    </div>
+
+    <div id="tuning-help">
+        <b>If the sabers move the wrong way</b>
+        <span><kbd>X</kbd> flip left/right</span>
+        <span><kbd>Y</kbd> flip up/down</span>
+        <span><kbd>R</kbd> flip twist</span>
+        <span><kbd>[</kbd> <kbd>]</kbd> sensitivity</span>
+        <span><kbd>;</kbd> <kbd>'</kbd> smooth / snappy</span>
+        <span><kbd>-</kbd> <kbd>=</kbd> fewer / more blocks</span>
+        <span><kbd>L</kbd> load your own song</span>
+        <span><kbd>D</kbd> controller diagnostics</span>
+        <span><kbd>V</kbd> rumble on / off</span>
+        <span><kbd>0</kbd> reset</span>
+    </div>
+
+    <div id="sky"></div>
+    <div id="ceiling"></div>
+    <div id="floor"></div>
+
+    <div id="dancers"></div>
+    <div id="petals"></div>
+
+    <div id="callout"></div>
+    <div id="speed-lines"></div>
+    <div id="damage-flash"></div>
+
+    <div id="miss-breakdown" hidden></div>
+
+    <div id="judgment"></div>
+
+    <div id="song-drop">
+        <div>
+            <strong>Drop a song to play it</strong>
+            <span>mp3, wav, ogg, m4a, flac — anything the browser can decode</span>
+        </div>
+    </div>
+
+    <div id="song-status" hidden></div>
+
+    <div id="devices" hidden></div>
+    <div id="score">0   hit 0   missed 0   streak 0   best 0</div>
+    <div id="music-info" hidden>♫ Synced to beat</div>
+
+    <div id="prompt" hidden>
+        <div id="prompt-message"></div>
+        <div id="prompt-feedback"></div>
+    </div>
+
+    <div id="play-area">
+        <div id="stage">
+            <div id="left-saber" class="saber"></div>
+            <div id="left-cross" class="saber cross"></div>
+            <div id="right-saber" class="saber"></div>
+            <div id="right-cross" class="saber cross"></div>
+
+            <div id="left-hilt" class="hilt"></div>
+            <div id="right-hilt" class="hilt"></div>
+            <div id="left-tip" class="tip"></div>
+            <div id="right-tip" class="tip"></div>
+        </div>
+    </div>
+
+    <div id="slash">left: —    right: —</div>
+
+    <div id="test-cursor"></div>
+
+    <pre id="debug"></pre>
+
+    <script type="module" src="/main.js"></script>
+</body>
+</html>
