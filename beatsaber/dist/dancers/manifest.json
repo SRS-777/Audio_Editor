@@ -1,0 +1,8 @@
+[
+  { "file": "schoolgirl.webp",  "height": 280 },
+  { "file": "white-hair.webp",  "height": 280 },
+  { "file": "dark-coat.webp",   "height": 290, "lift": 1.55 },
+  { "file": "pixel-chibi.webp", "height": 165 },
+  { "file": "cat.webp",         "height": 150 },
+  { "file": "blob.webp",        "height": 150 }
+]

@@ -19,6 +19,28 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput,QMediaDevices
 from scipy.signal import resample
 from scipy.signal import fftconvolve
 from jukebox_gui import JukeboxWindow
+import beatsaber_launcher
+
+
+def _joycon_note():
+    """
+    Warn when the game could not get its usual port.
+
+    The browser grants a Joy-Con to an origin, and the port is
+    part of the origin - so on any port but the usual one the
+    controllers have to be picked from the browser chooser
+    again, one click each. Saying so here is the difference
+    between a small chore and a controller that appears not to
+    be detected.
+    """
+    if getattr(beatsaber_launcher, 'port_is_stable', True):
+        return ''
+
+    return (
+        '  Note: the usual port was busy, so this is a new '
+        'origin to the browser - press Connect Joy-Con once '
+        'per controller.'
+    )
 from encryption import (
     embed  as wm_embed,
     reveal as wm_reveal,
@@ -861,6 +883,50 @@ class AudioWorkstation(QMainWindow):
 
         jukebox_layout.addWidget(jukebox_group, 1)
         self.tab_widget.addTab(jukebox_tab, "Jukebox")
+
+        # ========== Beat Saber Tab ==========
+        saber_tab = QWidget()
+        saber_layout = QHBoxLayout(saber_tab)
+        saber_layout.setContentsMargins(8, 8, 8, 8)
+        saber_layout.setSpacing(12)
+
+        saber_group = QGroupBox("Beat Saber")
+        saber_grid = QGridLayout(saber_group)
+        saber_grid.setVerticalSpacing(8)
+        saber_grid.setHorizontalSpacing(10)
+
+        lbl_saber = QLabel(
+            "Cut blocks in time with the music, with a Joy-Con in each hand. "
+            "Opens in your browser, because the controllers are read over WebHID "
+            "\u2014 use Chrome or Edge, and pair the Joy-Cons to Windows first.\n\n"
+            "Playing the current track analyses it for beats and sends it to the "
+            "game, so the blocks arrive on the song you have open here."
+        )
+        lbl_saber.setWordWrap(True)
+        saber_grid.addWidget(lbl_saber, 0, 0, 1, 2)
+
+        self.btn_saber_current = QPushButton("Play Current Track")
+        self.btn_saber_current.setToolTip(
+            "Detect the beats of the loaded track and play the game against it"
+        )
+        saber_grid.addWidget(self.btn_saber_current, 1, 0)
+
+        self.btn_saber_open = QPushButton("Open Beat Saber")
+        self.btn_saber_open.setToolTip(
+            "Open the game with the song it ships with"
+        )
+        saber_grid.addWidget(self.btn_saber_open, 1, 1)
+
+        self.saber_lbl_status = QLabel("Ready.")
+        self.saber_lbl_status.setWordWrap(True)
+        saber_grid.addWidget(self.saber_lbl_status, 2, 0, 1, 2)
+
+        saber_grid.setColumnStretch(0, 1)
+        saber_grid.setColumnStretch(1, 1)
+        fill_group(saber_group)
+
+        saber_layout.addWidget(saber_group, 1)
+        self.tab_widget.addTab(saber_tab, "Beat Saber")
                 # ========== Watermark Tab ==========
         wm_tab = QWidget()
         wm_layout = QVBoxLayout(wm_tab)
@@ -956,6 +1022,8 @@ class AudioWorkstation(QMainWindow):
 
         self.btn_jukebox_current.clicked.connect(self.open_jukebox_with_current)
         self.btn_jukebox_open.clicked.connect(self.open_jukebox)
+        self.btn_saber_current.clicked.connect(self.open_beat_saber_with_current)
+        self.btn_saber_open.clicked.connect(self.open_beat_saber)
         self.btn_wm_sync.clicked.connect(self.wm_sync_from_editor)
         self.btn_wm_embed.clicked.connect(self.wm_embed_action)
         self.btn_wm_reveal.clicked.connect(self.wm_reveal_action)
@@ -2165,6 +2233,80 @@ class AudioWorkstation(QMainWindow):
             QMessageBox.warning(self, "No Audio", "Load audio first.")
             return
         self.open_jukebox().load_track(*self._editor_track())
+
+    # ------------------------------------------------------------------
+    # Beat Saber
+    # ------------------------------------------------------------------
+    def open_beat_saber(self):
+        """Open the game with the song it ships with."""
+        beatsaber_launcher.clear_custom_track()
+
+        try:
+            url = beatsaber_launcher.open_game()
+        except FileNotFoundError as error:
+            self.saber_lbl_status.setText(str(error))
+            QMessageBox.warning(self, "Beat Saber", str(error))
+            return
+
+        self.saber_lbl_status.setText(
+            f"Running at {url} \u2014 opened in your browser."
+            + _joycon_note()
+        )
+
+    def open_beat_saber_with_current(self):
+        """Send the loaded track to the game and open it."""
+        if self.current_audio is None:
+            QMessageBox.warning(self, "No Audio", "Load audio first.")
+            return
+
+        if not beatsaber_launcher.is_available():
+            message = (
+                "The game has not been built. Run 'npm install' then "
+                "'npx vite build' in the beatsaber folder."
+            )
+            self.saber_lbl_status.setText(message)
+            QMessageBox.warning(self, "Beat Saber", message)
+            return
+
+        audio, sr, name = self._editor_track()
+
+        self.saber_lbl_status.setText(
+            "Detecting beats\u2026 this takes a moment for a long track."
+        )
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+
+        try:
+            import jukebox_engine as je
+
+            analysis = je.analyze(audio, sr)
+
+            beats = [
+                analysis.beat_time(index)
+                for index in range(analysis.n_beats)
+            ]
+
+            count, bpm = beatsaber_launcher.write_custom_track(
+                audio, sr, beats, name
+            )
+
+            url = beatsaber_launcher.open_game()
+        except Exception as error:
+            self.saber_lbl_status.setText(
+                f"Could not prepare the track: {error}"
+            )
+            QMessageBox.warning(
+                self, "Beat Saber", f"Could not prepare the track:\n{error}"
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self.saber_lbl_status.setText(
+            f"{name or 'Current track'}: {count} beats at {bpm} BPM. "
+            f"Running at {url} \u2014 opened in your browser."
+            + _joycon_note()
+        )
         # ------------------------------------------------------------------
     # Watermark
     # ------------------------------------------------------------------
