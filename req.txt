@@ -1,5 +1,0 @@
-numpy
-soundfile
-matplotlib
-PyQt6
-scipy
